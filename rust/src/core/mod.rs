@@ -509,6 +509,7 @@ pub mod tcc_guard_sandbox;
 pub mod tdd_schema;
 pub mod telemetry;
 pub(crate) mod telemetry_ledger;
+pub mod telemetry_v2;
 pub mod terse;
 pub(crate) mod text_decode;
 pub mod theme;

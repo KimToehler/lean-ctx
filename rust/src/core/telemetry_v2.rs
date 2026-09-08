@@ -7,6 +7,28 @@ use uuid::Uuid;
 pub const SCHEMA_VERSION: u16 = 2;
 pub const MAX_COUNT: u64 = 1_000_000_000;
 pub const MAX_HISTOGRAM_BUCKETS: usize = 32;
+pub const MAX_BATCH_EVENTS: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryBatchV2 {
+    pub schema_version: u16,
+    pub events: Vec<TelemetryEnvelopeV2>,
+}
+
+impl TelemetryBatchV2 {
+    pub fn validate(&self) -> Result<(), TelemetryValidationError> {
+        if self.schema_version != SCHEMA_VERSION {
+            return Err(TelemetryValidationError::SchemaVersion);
+        }
+        if self.events.is_empty() || self.events.len() > MAX_BATCH_EVENTS {
+            return Err(TelemetryValidationError::BatchSize);
+        }
+        self.events
+            .iter()
+            .try_for_each(TelemetryEnvelopeV2::validate)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -133,6 +155,8 @@ impl TelemetryEventV2 {
 pub struct HeartbeatMetrics {
     pub distribution_channel: DistributionChannel,
     pub client_family: ClientFamily,
+    pub operating_system: OperatingSystem,
+    pub architecture: Architecture,
 }
 
 impl HeartbeatMetrics {
@@ -342,6 +366,46 @@ pub enum ClientFamily {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum OperatingSystem {
+    Macos,
+    Linux,
+    Windows,
+    Other,
+}
+
+impl OperatingSystem {
+    #[must_use]
+    pub fn current() -> Self {
+        match std::env::consts::OS {
+            "macos" => Self::Macos,
+            "linux" => Self::Linux,
+            "windows" => Self::Windows,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Architecture {
+    X86_64,
+    Aarch64,
+    Other,
+}
+
+impl Architecture {
+    #[must_use]
+    pub fn current() -> Self {
+        match std::env::consts::ARCH {
+            "x86_64" => Self::X86_64,
+            "aarch64" => Self::Aarch64,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ErrorCategory {
     Authentication,
     Authorization,
@@ -364,6 +428,7 @@ pub enum TelemetryValidationError {
     InconsistentCounts,
     Histogram,
     VersionDirection,
+    BatchSize,
 }
 
 fn bounded(value: u64) -> Result<(), TelemetryValidationError> {
@@ -411,8 +476,28 @@ mod tests {
     }
 
     #[test]
+    fn batch_is_bounded_and_validates_every_event() {
+        let event = envelope(TelemetryEventV2::Heartbeat(HeartbeatMetrics {
+            distribution_channel: DistributionChannel::Cargo,
+            client_family: ClientFamily::Codex,
+            operating_system: OperatingSystem::Linux,
+            architecture: Architecture::X86_64,
+        }));
+        let batch = TelemetryBatchV2 {
+            schema_version: SCHEMA_VERSION,
+            events: vec![event],
+        };
+        assert!(batch.validate().is_ok());
+        let empty = TelemetryBatchV2 {
+            schema_version: SCHEMA_VERSION,
+            events: Vec::new(),
+        };
+        assert_eq!(empty.validate(), Err(TelemetryValidationError::BatchSize));
+    }
+
+    #[test]
     fn unknown_fields_are_rejected() {
-        let raw = r#"{"schema_version":2,"timestamp_bucket":"2026-09-08","installation_id":"550e8400-e29b-41d4-a716-446655440000","app_version":"4.0.0","raw_task":"secret","event":{"name":"heartbeat","metrics":{"distribution_channel":"cargo","client_family":"codex"}}}"#;
+        let raw = r#"{"schema_version":2,"timestamp_bucket":"2026-09-08","installation_id":"550e8400-e29b-41d4-a716-446655440000","app_version":"4.0.0","raw_task":"secret","event":{"name":"heartbeat","metrics":{"distribution_channel":"cargo","client_family":"codex","operating_system":"linux","architecture":"x86_64"}}}"#;
         assert!(serde_json::from_str::<TelemetryEnvelopeV2>(raw).is_err());
     }
 
@@ -421,6 +506,8 @@ mod tests {
         let mut event = envelope(TelemetryEventV2::Heartbeat(HeartbeatMetrics {
             distribution_channel: DistributionChannel::Cargo,
             client_family: ClientFamily::Codex,
+            operating_system: OperatingSystem::Linux,
+            architecture: Architecture::X86_64,
         }));
         event.installation_id = "not-a-uuid".into();
         assert_eq!(

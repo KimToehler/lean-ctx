@@ -51,7 +51,7 @@ pub(super) fn cmd_telemetry(args: &[String]) {
         "on" | "enable" => set_enabled(true),
         "off" | "disable" => set_enabled(false),
         "reset-id" => reset_id(),
-        "show" => show_payload(),
+        "show" | "pending" => show_payload(),
         "history" | "log" => show_history(),
         "--help" | "-h" => print_help(),
         other => {
@@ -137,15 +137,23 @@ fn reset_id() {
 }
 
 fn show_payload() {
-    let id = installation_id::get_or_create().unwrap_or_else(|_| "<error>".to_string());
-    let contribute = crate::cloud_sync::collect_contribute_entries();
-    let payload = serde_json::json!({
-        "installation_id": id,
-        "version": env!("CARGO_PKG_VERSION"),
-        "os": std::env::consts::OS,
-        "arch": std::env::consts::ARCH,
-        "contribute_entries": contribute,
-    });
+    let cfg = config::Config::load_global();
+    let do_not_track = std::env::var("DO_NOT_TRACK").ok();
+    let telemetry_override = std::env::var("LEAN_CTX_TELEMETRY").ok();
+    if !cfg
+        .telemetry
+        .send_eligible(do_not_track.as_deref(), telemetry_override.as_deref())
+    {
+        println!("No telemetry payload is currently eligible for sending.");
+        return;
+    }
+    let payload = match crate::core::telemetry_aggregate::pending_daily_batch() {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("Unable to build telemetry payload: {error}");
+            return;
+        }
+    };
 
     println!("This is the exact JSON that would be sent to api.leanctx.com:");
     println!();
@@ -155,7 +163,7 @@ fn show_payload() {
     );
     println!();
     println!(
-        "\x1b[2mEndpoint: POST {}/api/telemetry/heartbeat\x1b[0m",
+        "\x1b[2mEndpoint: POST {}/api/telemetry/v2/batch\x1b[0m",
         api_url()
     );
     println!("\x1b[2mFrequency: at most once per day\x1b[0m");
@@ -202,6 +210,7 @@ fn print_help() {
     println!("  on         Enable anonymous heartbeat");
     println!("  off        Disable anonymous heartbeat");
     println!("  show       Display the exact payload that would be sent");
+    println!("  pending    Display the exact typed batch currently eligible for sending");
     println!("  reset-id   Regenerate the anonymous installation ID");
     println!("  history    Show log of all sent heartbeats");
     println!();

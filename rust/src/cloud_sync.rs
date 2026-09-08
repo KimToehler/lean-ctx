@@ -110,25 +110,23 @@ pub fn cloud_background_tasks() {
         .send_eligible(do_not_track.as_deref(), telemetry_override.as_deref())
         && !already_heartbeated
     {
-        if let Ok(id) = crate::core::installation_id::get_or_create() {
-            let contribute = collect_contribute_entries();
-            let payload = serde_json::json!({
-                "installation_id": id,
-                "version": env!("CARGO_PKG_VERSION"),
-                "os": std::env::consts::OS,
-                "arch": std::env::consts::ARCH,
-                "contribute_entries": contribute,
-            });
-            if crate::cloud_client::heartbeat(&payload).is_ok() {
+        if let Ok(batch) = crate::core::telemetry_aggregate::pending_daily_batch() {
+            let installation_id = batch
+                .events
+                .first()
+                .map(|event| event.installation_id.clone());
+            if crate::cloud_client::telemetry_v2_batch(&batch).is_ok() {
                 config.telemetry.last_heartbeat = Some(today.clone());
-                let record = crate::core::telemetry_ledger::HeartbeatRecord {
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    installation_id: id.clone(),
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                    os: std::env::consts::OS.to_string(),
-                    arch: std::env::consts::ARCH.to_string(),
-                };
-                let _ = crate::core::telemetry_ledger::append(&record);
+                if let Some(installation_id) = installation_id {
+                    let record = crate::core::telemetry_ledger::HeartbeatRecord {
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        installation_id,
+                        version: env!("CARGO_PKG_VERSION").to_string(),
+                        os: std::env::consts::OS.to_string(),
+                        arch: std::env::consts::ARCH.to_string(),
+                    };
+                    let _ = crate::core::telemetry_ledger::append(&record);
+                }
             }
         }
     }

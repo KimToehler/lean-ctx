@@ -463,6 +463,27 @@ pub fn submit_product_feedback(payload: &serde_json::Value) -> Result<String, St
     Ok(json["message"].as_str().unwrap_or("Thanks").to_string())
 }
 
+/// Send one validated telemetry-v2 daily batch. No authentication required.
+pub fn telemetry_v2_batch(
+    batch: &crate::core::telemetry_v2::TelemetryBatchV2,
+) -> Result<String, String> {
+    batch
+        .validate()
+        .map_err(|error| format!("Telemetry validation failed: {error:?}"))?;
+    let url = format!("{}/api/telemetry/v2/batch", api_url());
+    let response = ureq::post(&url)
+        .header("Content-Type", "application/json")
+        .send(&serde_json::to_vec(batch).map_err(|error| format!("JSON error: {error}"))?)
+        .map_err(|error| format!("Telemetry v2 batch failed: {error}"))?;
+    let body = response
+        .into_body()
+        .read_to_string()
+        .map_err(|error| format!("Failed to read response: {error}"))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&body).map_err(|error| format!("Invalid JSON: {error}"))?;
+    Ok(json["message"].as_str().unwrap_or("OK").to_string())
+}
+
 /// Result of a successful Wrapped publish (`POST /api/wrapped`). The `edit_token` is returned
 /// (and must be stored to delete/claim later) only on a *fresh* insert; on a signed re-publish
 /// the server updates the existing card in place and omits it (the client keeps the stored one).

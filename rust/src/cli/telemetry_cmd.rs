@@ -4,6 +4,44 @@
 
 use crate::core::config;
 use crate::core::installation_id;
+use std::io::IsTerminal;
+
+const DEFAULT_ON_NOTICE: &str = "LeanCTX anonymous product telemetry is enabled by default.\n\nSent: version, OS/arch, anonymous install ID, coarse feature/health aggregates.\nNever sent: prompts, source code, file contents, filenames, commands, secrets.\n\nInspect:  lean-ctx telemetry show\nDisable:  lean-ctx telemetry off\nHistory:  lean-ctx telemetry history";
+
+pub(crate) fn maybe_show_default_on_notice() {
+    let terminal = std::io::stderr().is_terminal();
+    let ci = std::env::var_os("CI").is_some();
+    let do_not_track = std::env::var("DO_NOT_TRACK").ok();
+    let telemetry_override = std::env::var("LEAN_CTX_TELEMETRY").ok();
+    let cfg = config::Config::load_global();
+    if !should_show_default_on_notice(
+        &cfg.telemetry,
+        terminal,
+        ci,
+        do_not_track.as_deref(),
+        telemetry_override.as_deref(),
+    ) {
+        return;
+    }
+
+    if config::setter::set_by_key("telemetry.notice_shown", "true").is_ok() {
+        eprintln!("{DEFAULT_ON_NOTICE}");
+    }
+}
+
+fn should_show_default_on_notice(
+    telemetry: &config::TelemetryConfig,
+    terminal: bool,
+    ci: bool,
+    do_not_track: Option<&str>,
+    env_override: Option<&str>,
+) -> bool {
+    terminal
+        && !ci
+        && !telemetry.notice_shown
+        && !telemetry.explicitly_disabled()
+        && !config::TelemetryConfig::environment_disables(do_not_track, env_override)
+}
 
 pub(super) fn cmd_telemetry(args: &[String]) {
     let sub = args.first().map(String::as_str).unwrap_or("status");
@@ -26,7 +64,7 @@ pub(super) fn cmd_telemetry(args: &[String]) {
 
 fn show_status() {
     let cfg = config::Config::load();
-    let enabled = cfg.telemetry.enabled;
+    let enabled = !cfg.telemetry.explicitly_disabled();
     let last = cfg.telemetry.last_heartbeat.as_deref().unwrap_or("never");
 
     println!(
@@ -53,10 +91,18 @@ fn show_status() {
 }
 
 fn set_enabled(enabled: bool) {
-    match config::setter::set_by_key("telemetry.enabled", if enabled { "true" } else { "false" }) {
+    let preference = if enabled {
+        "explicitly_enabled"
+    } else {
+        "explicitly_disabled"
+    };
+    match config::setter::set_many_by_key(&[
+        ("telemetry.enabled", if enabled { "true" } else { "false" }),
+        ("telemetry.preference", preference),
+        ("telemetry.notice_shown", "true"),
+        ("cloud.contribute_enabled", "false"),
+    ]) {
         Ok(_) => {
-            // Clear legacy contribute_enabled — telemetry.enabled is now the single flag.
-            let _ = config::setter::set_by_key("cloud.contribute_enabled", "false");
             if enabled {
                 println!("Telemetry enabled — thank you for helping improve lean-ctx!");
                 println!("Sent daily: version, OS, arch, compression patterns, random install ID.");
@@ -149,7 +195,7 @@ fn show_history() {
 fn print_help() {
     println!("Usage: lean-ctx telemetry [subcommand]");
     println!();
-    println!("Manage anonymous usage telemetry (opt-in, no PII).");
+    println!("Manage privacy-safe telemetry (default-on, fully disableable, no PII).");
     println!();
     println!("Subcommands:");
     println!("  status     Show current telemetry status (default)");
@@ -161,4 +207,51 @@ fn print_help() {
     println!();
     println!("The heartbeat sends: version, OS, architecture, compression patterns,");
     println!("and a random install UUID. No code, filenames, or personal data — ever.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_notice_requires_an_eligible_interactive_run() {
+        let cfg = config::TelemetryConfig::default();
+        assert!(should_show_default_on_notice(&cfg, true, false, None, None));
+        assert!(!should_show_default_on_notice(
+            &cfg, false, false, None, None
+        ));
+        assert!(!should_show_default_on_notice(&cfg, true, true, None, None));
+        assert!(!should_show_default_on_notice(
+            &cfg,
+            true,
+            false,
+            Some("1"),
+            None
+        ));
+        assert!(!should_show_default_on_notice(
+            &cfg,
+            true,
+            false,
+            None,
+            Some("off")
+        ));
+    }
+
+    #[test]
+    fn default_notice_never_overrides_persisted_user_state() {
+        let shown = config::TelemetryConfig {
+            notice_shown: true,
+            ..config::TelemetryConfig::default()
+        };
+        assert!(!should_show_default_on_notice(
+            &shown, true, false, None, None
+        ));
+        let disabled = config::TelemetryConfig {
+            enabled: false,
+            ..config::TelemetryConfig::default()
+        };
+        assert!(!should_show_default_on_notice(
+            &disabled, true, false, None, None
+        ));
+    }
 }

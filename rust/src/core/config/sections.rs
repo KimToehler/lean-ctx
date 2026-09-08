@@ -794,19 +794,72 @@ impl AutonomyConfig {
     }
 }
 
-/// Anonymous opt-in telemetry heartbeat settings.
+/// Persisted telemetry choice. This distinguishes the v4 default from a user
+/// choice so upgrades never erase an earlier opt-out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryPreference {
+    #[default]
+    DefaultOn,
+    ExplicitlyEnabled,
+    ExplicitlyDisabled,
+}
+
+/// Privacy-safe product telemetry settings.
 ///
 /// When enabled, lean-ctx sends a daily heartbeat to `api.leanctx.com` containing
 /// only: a random installation ID (UUID v4), the lean-ctx version, OS, and CPU
 /// architecture. No code, filenames, usage patterns, or personal data — ever.
-/// Disabled by default; enable during setup or with `lean-ctx telemetry on`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Enabled by default in v4, but transmission remains blocked until the
+/// one-time notice has been processed on an eligible interactive run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TelemetryConfig {
-    /// Master switch for the anonymous heartbeat. Off by default (opt-in).
+    /// Master switch for privacy-safe product telemetry.
     pub enabled: bool,
+    /// Whether the state came from the v4 default or an explicit user choice.
+    pub preference: TelemetryPreference,
+    /// Persisted one-time disclosure gate. No default-on send occurs before it.
+    pub notice_shown: bool,
     /// Daily debounce: YYYY-MM-DD of the last successful heartbeat.
     pub last_heartbeat: Option<String>,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            preference: TelemetryPreference::DefaultOn,
+            notice_shown: false,
+            last_heartbeat: None,
+        }
+    }
+}
+
+impl TelemetryConfig {
+    #[must_use]
+    pub fn environment_disables(do_not_track: Option<&str>, env_override: Option<&str>) -> bool {
+        do_not_track.is_some_and(|value| value.trim() == "1")
+            || env_override.is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "off" | "false" | "0" | "no"
+                )
+            })
+    }
+
+    #[must_use]
+    pub fn explicitly_disabled(&self) -> bool {
+        !self.enabled || self.preference == TelemetryPreference::ExplicitlyDisabled
+    }
+
+    #[must_use]
+    pub fn send_eligible(&self, do_not_track: Option<&str>, env_override: Option<&str>) -> bool {
+        self.enabled
+            && self.preference != TelemetryPreference::ExplicitlyDisabled
+            && self.notice_shown
+            && !Self::environment_disables(do_not_track, env_override)
+    }
 }
 
 /// Cloud sync and contribution settings (pattern sharing, model pulls).
@@ -1604,9 +1657,11 @@ mod telemetry_tests {
     use super::*;
 
     #[test]
-    fn telemetry_config_defaults_to_disabled() {
+    fn telemetry_config_defaults_on_but_notice_gated() {
         let cfg = TelemetryConfig::default();
-        assert!(!cfg.enabled);
+        assert!(cfg.enabled);
+        assert_eq!(cfg.preference, TelemetryPreference::DefaultOn);
+        assert!(!cfg.notice_shown);
         assert!(cfg.last_heartbeat.is_none());
     }
 
@@ -1623,6 +1678,8 @@ last_heartbeat = "2026-07-30"
         }
         let wrap: Wrap = toml::from_str(toml_str).expect("parse telemetry config");
         assert!(wrap.telemetry.enabled);
+        assert_eq!(wrap.telemetry.preference, TelemetryPreference::DefaultOn);
+        assert!(!wrap.telemetry.notice_shown);
         assert_eq!(wrap.telemetry.last_heartbeat.as_deref(), Some("2026-07-30"));
     }
 
@@ -1635,7 +1692,27 @@ last_heartbeat = "2026-07-30"
             telemetry: TelemetryConfig,
         }
         let wrap: Wrap = toml::from_str(toml_str).expect("parse empty config");
-        assert!(!wrap.telemetry.enabled);
+        assert!(wrap.telemetry.enabled);
+        assert_eq!(wrap.telemetry.preference, TelemetryPreference::DefaultOn);
+        assert!(!wrap.telemetry.notice_shown);
         assert!(wrap.telemetry.last_heartbeat.is_none());
+    }
+
+    #[test]
+    fn legacy_false_remains_an_explicit_opt_out() {
+        let cfg: TelemetryConfig = toml::from_str("enabled = false").expect("legacy config");
+        assert!(cfg.explicitly_disabled());
+    }
+
+    #[test]
+    fn send_requires_notice_and_honors_both_environment_opt_outs() {
+        let mut cfg = TelemetryConfig::default();
+        assert!(!cfg.send_eligible(None, None));
+        cfg.notice_shown = true;
+        assert!(cfg.send_eligible(None, None));
+        assert!(!cfg.send_eligible(Some("1"), None));
+        assert!(!cfg.send_eligible(None, Some("OFF")));
+        cfg.preference = TelemetryPreference::ExplicitlyDisabled;
+        assert!(!cfg.send_eligible(None, None));
     }
 }

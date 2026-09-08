@@ -103,7 +103,13 @@ pub fn cloud_background_tasks() {
         .is_some_and(|d| d == today);
 
     // Unified anonymous telemetry: heartbeat + contribute entries in one request.
-    if config.telemetry.enabled && !already_heartbeated {
+    let do_not_track = std::env::var("DO_NOT_TRACK").ok();
+    let telemetry_override = std::env::var("LEAN_CTX_TELEMETRY").ok();
+    if config
+        .telemetry
+        .send_eligible(do_not_track.as_deref(), telemetry_override.as_deref())
+        && !already_heartbeated
+    {
         if let Ok(id) = crate::core::installation_id::get_or_create() {
             let contribute = collect_contribute_entries();
             let payload = serde_json::json!({

@@ -13,6 +13,7 @@ pub const MAX_BATCH_EVENTS: usize = 64;
 #[serde(deny_unknown_fields)]
 pub struct TelemetryBatchV2 {
     pub schema_version: u16,
+    pub deletion_token_hash: String,
     pub events: Vec<TelemetryEnvelopeV2>,
 }
 
@@ -21,6 +22,9 @@ impl TelemetryBatchV2 {
         if self.schema_version != SCHEMA_VERSION {
             return Err(TelemetryValidationError::SchemaVersion);
         }
+        if !valid_digest(&self.deletion_token_hash) {
+            return Err(TelemetryValidationError::DeletionTokenHash);
+        }
         if self.events.is_empty() || self.events.len() > MAX_BATCH_EVENTS {
             return Err(TelemetryValidationError::BatchSize);
         }
@@ -28,6 +32,13 @@ impl TelemetryBatchV2 {
             .iter()
             .try_for_each(TelemetryEnvelopeV2::validate)
     }
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,6 +431,7 @@ pub enum ErrorCategory {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelemetryValidationError {
     SchemaVersion,
+    DeletionTokenHash,
     TimestampBucket,
     InstallationId,
     PseudonymousId,
@@ -485,11 +497,19 @@ mod tests {
         }));
         let batch = TelemetryBatchV2 {
             schema_version: SCHEMA_VERSION,
+            deletion_token_hash: "a".repeat(64),
             events: vec![event],
         };
         assert!(batch.validate().is_ok());
+        let mut invalid_credential = batch.clone();
+        invalid_credential.deletion_token_hash = "raw-secret".into();
+        assert_eq!(
+            invalid_credential.validate(),
+            Err(TelemetryValidationError::DeletionTokenHash)
+        );
         let empty = TelemetryBatchV2 {
             schema_version: SCHEMA_VERSION,
+            deletion_token_hash: "a".repeat(64),
             events: Vec::new(),
         };
         assert_eq!(empty.validate(), Err(TelemetryValidationError::BatchSize));

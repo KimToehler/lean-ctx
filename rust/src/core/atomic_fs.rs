@@ -53,17 +53,21 @@ pub(crate) fn try_atomic_write(
     let tmp = parent.join(format!(".{filename}.lean-ctx.tmp.{pid}.{nanos}"));
 
     {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(perms) = permissions {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            options.mode(perms.mode());
+        }
+        let mut f = options.open(&tmp)?;
         f.write_all(bytes)?;
-        let _ = f.flush();
-        let _ = f.sync_all();
+        f.flush()?;
+        f.sync_all()?;
     }
 
     if let Some(perms) = permissions {
-        let _ = std::fs::set_permissions(&tmp, perms.clone());
+        std::fs::set_permissions(&tmp, perms.clone())?;
     }
 
     // #956: on Windows, `rename` fails outright if `path` already exists, so

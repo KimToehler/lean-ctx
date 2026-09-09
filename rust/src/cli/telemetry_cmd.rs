@@ -123,6 +123,26 @@ fn set_enabled(enabled: bool) {
 }
 
 fn reset_id() {
+    let (current_id, deletion_token) = match installation_id::get_or_create_identity() {
+        Ok(identity) => identity,
+        Err(error) => {
+            eprintln!("Failed to read telemetry identity: {error}");
+            std::process::exit(1);
+        }
+    };
+    match crate::cloud_client::delete_remote_telemetry(&current_id, &deletion_token) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!(
+                "Installation ID was not reset because its remote telemetry could not be deleted."
+            );
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("Installation ID was not reset: {error}");
+            std::process::exit(1);
+        }
+    }
     match installation_id::reset() {
         Ok(new_id) => {
             println!(
@@ -213,15 +233,27 @@ fn purge_local() {
 }
 
 fn delete_remote() {
-    let installation_id = match installation_id::get_or_create() {
-        Ok(id) => id,
+    let (installation_id, deletion_token) = match installation_id::get_or_create_identity() {
+        Ok(identity) => identity,
         Err(error) => {
-            eprintln!("Failed to read installation ID: {error}");
+            eprintln!("Failed to read telemetry identity: {error}");
             std::process::exit(1);
         }
     };
-    match crate::cloud_client::delete_remote_telemetry(&installation_id) {
-        Ok(()) => println!("Remote telemetry for this installation was deleted."),
+    match crate::cloud_client::delete_remote_telemetry(&installation_id, &deletion_token) {
+        Ok(true) => match installation_id::reset() {
+            Ok(_) => println!("Remote telemetry was deleted and the local identity was rotated."),
+            Err(error) => {
+                eprintln!("Remote telemetry deleted, but local identity rotation failed: {error}");
+                std::process::exit(1);
+            }
+        },
+        Ok(false) => {
+            eprintln!(
+                "Remote telemetry was not deleted; send one current v2 batch first to register the deletion credential."
+            );
+            std::process::exit(1);
+        }
         Err(error) => {
             eprintln!("Failed to delete remote telemetry: {error}");
             std::process::exit(1);

@@ -1,5 +1,7 @@
 //! Privacy-safe daily telemetry aggregation.
 
+use sha2::Digest;
+
 use super::installation_id;
 use super::telemetry_v2::{
     Architecture, ClientFamily, DistributionChannel, HeartbeatMetrics, OperatingSystem,
@@ -7,11 +9,12 @@ use super::telemetry_v2::{
 };
 
 pub fn pending_daily_batch() -> Result<TelemetryBatchV2, String> {
-    let installation_id = installation_id::get_or_create()
+    let (installation_id, deletion_token) = installation_id::get_or_create_identity()
         .map_err(|error| format!("installation ID unavailable: {error}"))?;
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     build_daily_heartbeat(
         installation_id,
+        hex::encode(sha2::Sha256::digest(deletion_token.as_bytes())),
         date,
         distribution_channel(),
         client_family(),
@@ -20,12 +23,14 @@ pub fn pending_daily_batch() -> Result<TelemetryBatchV2, String> {
 
 pub fn build_daily_heartbeat(
     installation_id: String,
+    deletion_token_hash: String,
     timestamp_bucket: String,
     distribution_channel: DistributionChannel,
     client_family: ClientFamily,
 ) -> Result<TelemetryBatchV2, String> {
     let batch = TelemetryBatchV2 {
         schema_version: SCHEMA_VERSION,
+        deletion_token_hash,
         events: vec![TelemetryEnvelopeV2 {
             schema_version: SCHEMA_VERSION,
             timestamp_bucket,
@@ -80,6 +85,7 @@ mod tests {
     fn daily_batch_is_typed_bounded_and_contains_no_runtime_content() {
         let batch = build_daily_heartbeat(
             "550e8400-e29b-41d4-a716-446655440000".into(),
+            "a".repeat(64),
             "2026-09-09".into(),
             DistributionChannel::Cargo,
             ClientFamily::Codex,
@@ -100,6 +106,7 @@ mod tests {
         assert!(
             build_daily_heartbeat(
                 "raw-user-id".into(),
+                "a".repeat(64),
                 "2026-09-09".into(),
                 DistributionChannel::Unknown,
                 ClientFamily::Other,

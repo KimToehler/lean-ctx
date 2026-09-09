@@ -485,17 +485,45 @@ pub fn telemetry_v2_batch(
 }
 
 /// Delete every server-side aggregate associated with one installation ID.
-pub fn delete_remote_telemetry(installation_id: &str) -> Result<(), String> {
+pub fn delete_remote_telemetry(
+    installation_id: &str,
+    deletion_token: &str,
+) -> Result<bool, String> {
     let installation_id = uuid::Uuid::parse_str(installation_id)
         .map_err(|_| "Invalid installation ID".to_string())?;
     let url = format!(
         "{}/api/telemetry/v2/installations/{installation_id}",
         api_url()
     );
-    ureq::delete(&url)
+    if deletion_token.len() != 64
+        || !deletion_token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("Invalid telemetry deletion credential".to_string());
+    }
+    let response = ureq::delete(&url)
+        .header(
+            "Authorization",
+            &format!("TelemetryDelete v1.{deletion_token}"),
+        )
         .call()
         .map_err(|error| format!("Remote telemetry deletion failed: {error}"))?;
-    Ok(())
+    let status = response.status().as_u16();
+    let body = response
+        .into_body()
+        .read_to_string()
+        .map_err(|error| format!("Failed to read deletion response: {error}"))?;
+    deletion_confirmed(status, &body)
+}
+
+fn deletion_confirmed(status: u16, body: &str) -> Result<bool, String> {
+    if status == 204 {
+        return Ok(false);
+    }
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| format!("Invalid deletion response: {error}"))?;
+    Ok(value.get("deleted").and_then(serde_json::Value::as_bool) == Some(true))
 }
 
 /// Result of a successful Wrapped publish (`POST /api/wrapped`). The `edit_token` is returned
@@ -1279,6 +1307,14 @@ mod tests {
     // internally). Gating the import keeps the Windows cross-compile warning-free.
     #[cfg(unix)]
     use crate::core::data_dir::test_env_lock;
+
+    #[test]
+    fn telemetry_delete_response_requires_explicit_confirmation() {
+        assert!(deletion_confirmed(200, r#"{"deleted":true}"#).unwrap());
+        assert!(!deletion_confirmed(204, "").unwrap());
+        assert!(!deletion_confirmed(200, r#"{"deleted":false}"#).unwrap());
+        assert!(deletion_confirmed(200, "not-json").is_err());
+    }
 
     #[test]
     fn existing_card_publish_response_carries_recovery_challenge() {

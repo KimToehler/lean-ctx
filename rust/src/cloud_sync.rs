@@ -161,8 +161,12 @@ pub fn cloud_background_tasks() {
         if config.cloud.sync_stats_enabled && !already_synced {
             let store = crate::core::stats::load();
             let entries = build_sync_entries(&store);
-            if !entries.is_empty() && crate::cloud_client::sync_stats(&entries).is_ok() {
-                config.cloud.last_sync = Some(today.clone());
+            if !entries.is_empty() {
+                let result = crate::cloud_client::sync_stats(&entries);
+                record_sync_telemetry(&result);
+                if result.is_ok() {
+                    config.cloud.last_sync = Some(today.clone());
+                }
             }
         }
 
@@ -187,17 +191,21 @@ pub fn cloud_background_tasks() {
                 "tool_spend_usd": summary.tool_spend_usd,
                 "model_key": summary.model.model_key,
             });
-            if crate::cloud_client::push_gain(&[entry]).is_ok() {
+            let result = crate::cloud_client::push_gain(&[entry]);
+            record_sync_telemetry(&result);
+            if result.is_ok() {
                 config.cloud.last_gain_sync = Some(today.clone());
             }
         }
 
-        if config.cloud.sync_models_enabled
-            && !already_pulled
-            && let Ok(data) = crate::cloud_client::pull_cloud_models()
-        {
-            let _ = crate::cloud_client::save_cloud_models(&data);
-            config.cloud.last_model_pull = Some(today.clone());
+        if config.cloud.sync_models_enabled && !already_pulled {
+            let result = crate::cloud_client::pull_cloud_models().and_then(|data| {
+                crate::cloud_client::save_cloud_models(&data).map_err(|error| error.to_string())
+            });
+            record_sync_telemetry(&result);
+            if result.is_ok() {
+                config.cloud.last_model_pull = Some(today.clone());
+            }
         }
 
         // Opt-in Personal-Cloud auto-push (GL #384): silent, once per day,
@@ -230,7 +238,9 @@ pub fn cloud_background_tasks() {
                     .map(String::as_str),
                 &today,
             ) {
-                match crate::cloud_client::push_index_bundle(&root) {
+                let result = crate::cloud_client::push_index_bundle(&root);
+                record_sync_telemetry(&result);
+                match result {
                     Ok((hash, bytes)) => {
                         tracing::debug!(project = %hash, bytes, "auto-index: pushed");
                         config
@@ -285,14 +295,17 @@ fn auto_sync_personal_cloud() -> AutoSyncOutcome {
     let store = crate::core::stats::load();
     let mut results: Vec<Result<(), String>> = Vec::new();
 
-    let mut push = |label: &str, result: Result<String, String>| match result {
-        Ok(_) => {
-            tracing::debug!(surface = label, "auto-sync: pushed");
-            results.push(Ok(()));
-        }
-        Err(e) => {
-            tracing::debug!(surface = label, error = %e, "auto-sync: push failed");
-            results.push(Err(e));
+    let mut push = |label: &str, result: Result<String, String>| {
+        record_sync_telemetry(&result);
+        match result {
+            Ok(_) => {
+                tracing::debug!(surface = label, "auto-sync: pushed");
+                results.push(Ok(()));
+            }
+            Err(e) => {
+                tracing::debug!(surface = label, error = %e, "auto-sync: push failed");
+                results.push(Err(e));
+            }
         }
     };
 
@@ -350,6 +363,12 @@ fn auto_sync_personal_cloud() -> AutoSyncOutcome {
     }
 
     outcome
+}
+
+fn record_sync_telemetry<T>(result: &Result<T, String>) {
+    if let Err(error) = crate::core::telemetry_aggregate::record_sync_result(result.is_ok()) {
+        tracing::debug!("telemetry sync aggregate unavailable: {error}");
+    }
 }
 
 pub fn build_sync_entries(store: &crate::core::stats::StatsStore) -> Vec<serde_json::Value> {

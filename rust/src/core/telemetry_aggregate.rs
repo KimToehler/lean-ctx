@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 use super::installation_id;
 use super::telemetry_v2::{
     Architecture, ClientFamily, DistributionChannel, HeartbeatMetrics, Histogram, MAX_COUNT,
-    OccurrenceMetrics, OperatingSystem, SCHEMA_VERSION, SessionMetrics, TelemetryBatchV2,
-    TelemetryEnvelopeV2, TelemetryEventV2, ToolUsageMetrics, VersionUpgradeMetrics,
+    OccurrenceMetrics, OperatingSystem, SCHEMA_VERSION, SessionMetrics, SyncMetrics,
+    TelemetryBatchV2, TelemetryEnvelopeV2, TelemetryEventV2, ToolUsageMetrics,
+    VersionUpgradeMetrics,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -41,6 +42,8 @@ struct AggregateState {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OneShotState {
+    #[serde(default)]
+    installation_id: String,
     setup_recorded: bool,
     configured_integrations: BTreeSet<String>,
     observed_major: Option<u16>,
@@ -53,6 +56,8 @@ struct QueuedOneShots {
     setup_completed: bool,
     integrations_detected: u64,
     version_upgrade: Option<VersionTransition>,
+    #[serde(default)]
+    sync: SyncMetrics,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,7 +156,7 @@ pub fn begin_daily_send() -> Result<DailySendLease, String> {
         one_shot_lock
             .lock_exclusive()
             .map_err(|error| format!("cannot lock telemetry one-shot state: {error}"))?;
-        let one_shots = load_one_shots_at(&one_shot_path)?;
+        let one_shots = one_shots_for_current_identity(load_one_shots_at(&one_shot_path)?)?;
         let observed = current_checkpoint();
         let batch = build_from_current_counters(&state, &observed, &one_shots.queued)?;
         state.installation_id = batch_installation_id(&batch).to_string();
@@ -363,6 +368,12 @@ fn build_daily_aggregate(
             }),
         ));
     }
+    if queued.sync.attempts > 0 {
+        batch.events.push(envelope_like(
+            &common,
+            TelemetryEventV2::SyncAggregate(queued.sync.clone()),
+        ));
+    }
     batch
         .validate()
         .map_err(|error| format!("invalid telemetry batch: {error:?}"))?;
@@ -431,15 +442,7 @@ fn one_shot_path() -> Result<PathBuf, String> {
 pub fn record_setup_completion(
     integration_ids: impl IntoIterator<Item = String>,
 ) -> Result<(), String> {
-    let config = crate::core::config::Config::load_global();
-    let do_not_track = std::env::var("DO_NOT_TRACK").ok();
-    let telemetry_override = std::env::var("LEAN_CTX_TELEMETRY").ok();
-    if config.telemetry.explicitly_disabled()
-        || crate::core::config::TelemetryConfig::environment_disables(
-            do_not_track.as_deref(),
-            telemetry_override.as_deref(),
-        )
-    {
+    if !telemetry_collection_eligible() {
         return Ok(());
     }
     with_locked_one_shots(|mut state| {
@@ -465,6 +468,46 @@ pub fn record_setup_completion(
         }
         Ok((state, ()))
     })
+}
+
+pub fn record_sync_result(success: bool) -> Result<(), String> {
+    if !telemetry_collection_eligible() {
+        return Ok(());
+    }
+    with_locked_one_shots(|mut state| {
+        if state.queued.sync.attempts >= MAX_COUNT {
+            return Ok((state, ()));
+        }
+        state.queued.sync.attempts += 1;
+        if success {
+            state.queued.sync.successes = state
+                .queued
+                .sync
+                .successes
+                .saturating_add(1)
+                .min(state.queued.sync.attempts);
+        } else {
+            state.queued.sync.failures = state.queued.sync.failures.saturating_add(1).min(
+                state
+                    .queued
+                    .sync
+                    .attempts
+                    .saturating_sub(state.queued.sync.successes),
+            );
+        }
+        Ok((state, ()))
+    })
+}
+
+fn telemetry_collection_eligible() -> bool {
+    let config = crate::core::config::Config::load_global();
+    let do_not_track = std::env::var("DO_NOT_TRACK").ok();
+    let telemetry_override = std::env::var("LEAN_CTX_TELEMETRY").ok();
+    !config.telemetry.explicitly_disabled()
+        && !crate::core::config::TelemetryConfig::environment_disables(
+            do_not_track.as_deref(),
+            telemetry_override.as_deref(),
+        )
 }
 
 pub fn record_current_version() -> Result<(), String> {
@@ -539,8 +582,11 @@ pub fn rotate_identity_state_then<T>(
     one_shot_lock
         .lock_exclusive()
         .map_err(|error| format!("cannot lock telemetry one-shot state: {error}"))?;
-    let mut one_shots = load_one_shots_at(&one_shot_path)?;
+    let mut one_shots = one_shots_for_current_identity(load_one_shots_at(&one_shot_path)?)?;
+    write_one_shots(&one_shot_path, &one_shots)?;
     let value = operation()?;
+    one_shots.installation_id = installation_id::get_or_create()
+        .map_err(|error| format!("installation ID unavailable after rotation: {error}"))?;
     one_shots.queued.setup_completed |= one_shots.setup_recorded;
     one_shots.queued.integrations_detected = one_shots
         .configured_integrations
@@ -548,6 +594,7 @@ pub fn rotate_identity_state_then<T>(
         .try_into()
         .unwrap_or(MAX_COUNT)
         .min(MAX_COUNT);
+    one_shots.queued.sync = SyncMetrics::default();
     remove_state_file(&path, "aggregate")?;
     write_one_shots(&one_shot_path, &one_shots)?;
     Ok(value)
@@ -581,7 +628,7 @@ fn load_one_shots() -> Result<OneShotState, String> {
     let lock = open_sidecar_lock(&path)?;
     lock.lock_exclusive()
         .map_err(|error| format!("cannot lock telemetry one-shot state: {error}"))?;
-    load_one_shots_at(&path)
+    one_shots_for_current_identity(load_one_shots_at(&path)?)
 }
 
 fn load_one_shots_at(path: &std::path::Path) -> Result<OneShotState, String> {
@@ -593,6 +640,25 @@ fn load_one_shots_at(path: &std::path::Path) -> Result<OneShotState, String> {
     }
 }
 
+fn one_shots_for_current_identity(mut state: OneShotState) -> Result<OneShotState, String> {
+    let current = installation_id::get_or_create()
+        .map_err(|error| format!("installation ID unavailable: {error}"))?;
+    if state.installation_id.is_empty() {
+        state.installation_id = current;
+    } else if state.installation_id != current {
+        state.installation_id = current;
+        state.queued.setup_completed |= state.setup_recorded;
+        state.queued.integrations_detected = state
+            .configured_integrations
+            .len()
+            .try_into()
+            .unwrap_or(MAX_COUNT)
+            .min(MAX_COUNT);
+        state.queued.sync = SyncMetrics::default();
+    }
+    Ok(state)
+}
+
 fn with_locked_one_shots<T>(
     operation: impl FnOnce(OneShotState) -> Result<(OneShotState, T), String>,
 ) -> Result<T, String> {
@@ -601,7 +667,8 @@ fn with_locked_one_shots<T>(
     let lock = open_sidecar_lock(&path)?;
     lock.lock_exclusive()
         .map_err(|error| format!("cannot lock telemetry one-shot state: {error}"))?;
-    let (state, value) = operation(load_one_shots_at(&path)?)?;
+    let state = one_shots_for_current_identity(load_one_shots_at(&path)?)?;
+    let (state, value) = operation(state)?;
     write_one_shots(&path, &state)?;
     Ok(value)
 }
@@ -614,7 +681,7 @@ fn acknowledge_one_shots_at(
     let lock = open_sidecar_lock(path)?;
     lock.lock_exclusive()
         .map_err(|error| format!("cannot lock telemetry one-shot state: {error}"))?;
-    let mut state = load_one_shots_at(path)?;
+    let mut state = one_shots_for_current_identity(load_one_shots_at(path)?)?;
     if included.setup_completed {
         state.queued.setup_completed = false;
     }
@@ -622,6 +689,21 @@ fn acknowledge_one_shots_at(
         .queued
         .integrations_detected
         .saturating_sub(included.integrations_detected);
+    state.queued.sync.attempts = state
+        .queued
+        .sync
+        .attempts
+        .saturating_sub(included.sync.attempts);
+    state.queued.sync.successes = state
+        .queued
+        .sync
+        .successes
+        .saturating_sub(included.sync.successes);
+    state.queued.sync.failures = state
+        .queued
+        .sync
+        .failures
+        .saturating_sub(included.sync.failures);
     if let Some(sent) = included.version_upgrade {
         state.queued.version_upgrade = match state.queued.version_upgrade {
             Some(current) if current == sent => None,
@@ -824,6 +906,18 @@ mod tests {
             })
     }
 
+    fn sync_counts(batch: &TelemetryBatchV2) -> Option<(u64, u64, u64)> {
+        batch
+            .events
+            .iter()
+            .find_map(|envelope| match &envelope.event {
+                TelemetryEventV2::SyncAggregate(metrics) => {
+                    Some((metrics.attempts, metrics.successes, metrics.failures))
+                }
+                _ => None,
+            })
+    }
+
     #[test]
     fn daily_batch_is_typed_bounded_and_contains_no_runtime_content() {
         let batch = build_daily_heartbeat(
@@ -999,10 +1093,51 @@ mod tests {
         let _iso = crate::core::data_dir::isolated_data_dir();
         let _telemetry = TelemetryEnvGuard::disable();
         record_setup_completion(vec!["codex".into()]).expect("opted-out recording is a no-op");
+        record_sync_result(true).expect("opted-out sync recording is a no-op");
         assert!(!one_shot_path().expect("one-shot path").exists());
         let preview = preview_daily_batch().expect("preview");
         assert_eq!(occurrence_count(&preview, "setup_completed"), None);
         assert_eq!(occurrence_count(&preview, "integration_detected"), None);
+        assert_eq!(sync_counts(&preview), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sync_results_are_durable_and_ack_only_the_pending_snapshot() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        record_sync_result(true).expect("record success");
+        record_sync_result(false).expect("record failure");
+        let first = prepare_daily_batch().expect("prepare first");
+        assert_eq!(sync_counts(&first), Some((2, 1, 1)));
+
+        record_sync_result(true).expect("record concurrent success");
+        assert_eq!(prepare_daily_batch().expect("retry"), first);
+        acknowledge_daily_batch(&first).expect("ack first");
+        assert_eq!(
+            sync_counts(&preview_daily_batch().expect("residual preview")),
+            Some((1, 1, 0))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn saturated_sync_counter_remains_cross_field_consistent() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        with_locked_one_shots(|mut state| {
+            state.queued.sync = SyncMetrics {
+                attempts: MAX_COUNT,
+                successes: MAX_COUNT,
+                failures: 0,
+            };
+            Ok((state, ()))
+        })
+        .expect("seed saturated sync counts");
+
+        record_sync_result(false).expect("saturated recorder is a no-op");
+        assert_eq!(
+            sync_counts(&preview_daily_batch().expect("preview")),
+            Some((MAX_COUNT, MAX_COUNT, 0))
+        );
     }
 
     #[test]
@@ -1012,11 +1147,13 @@ mod tests {
         record_setup_completion(vec!["codex".into(), "claude".into()]).expect("record setup");
         let first = prepare_daily_batch().expect("prepare first");
         acknowledge_daily_batch(&first).expect("ack first");
+        record_sync_result(true).expect("record old-identity sync");
 
         rotate_identity_state_then(|| Ok(())).expect("rotate state");
         let replay = preview_daily_batch().expect("preview replay");
         assert_eq!(occurrence_count(&replay, "setup_completed"), Some(1));
         assert_eq!(occurrence_count(&replay, "integration_detected"), Some(2));
+        assert_eq!(sync_counts(&replay), None);
     }
 
     #[test]
@@ -1060,5 +1197,21 @@ mod tests {
                 .iter()
                 .all(|event| event.installation_id == current_id)
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn stale_sidecar_discards_sync_but_requeues_setup_after_identity_change() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        record_setup_completion(vec!["codex".into()]).expect("record setup");
+        let first = prepare_daily_batch().expect("prepare first");
+        acknowledge_daily_batch(&first).expect("ack setup");
+        record_sync_result(true).expect("record old-identity sync");
+
+        installation_id::reset().expect("simulate successful reset before sidecar cleanup");
+        let current = preview_daily_batch().expect("preview rebound sidecar");
+        assert_eq!(occurrence_count(&current, "setup_completed"), Some(1));
+        assert_eq!(occurrence_count(&current, "integration_detected"), Some(1));
+        assert_eq!(sync_counts(&current), None);
     }
 }

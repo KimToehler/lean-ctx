@@ -122,12 +122,28 @@ pub fn pending_daily_batch() -> Result<TelemetryBatchV2, String> {
 
 /// Build the exact currently eligible payload without advancing durable state.
 pub fn preview_daily_batch() -> Result<TelemetryBatchV2, String> {
-    let state = state_for_current_identity(load_state()?)?;
+    let path = state_path()?;
+    ensure_parent(&path)?;
+    let lock = open_state_lock(&path)?;
+    lock.try_lock_exclusive().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            "exact telemetry preview unavailable while a send is in progress".to_string()
+        } else {
+            format!("cannot lock telemetry aggregate state for preview: {error}")
+        }
+    })?;
+    let state = state_for_current_identity(load_state_at(&path)?)?;
     if let Some(pending) = state.pending {
         return Ok(pending.batch);
     }
     let observed = current_checkpoint();
-    let one_shots = load_one_shots()?;
+    let sidecar_path = one_shot_path()?;
+    ensure_parent(&sidecar_path)?;
+    let sidecar_lock = open_sidecar_lock(&sidecar_path)?;
+    sidecar_lock.try_lock_exclusive().map_err(|error| {
+        format!("exact telemetry preview unavailable: cannot lock one-shot state: {error}")
+    })?;
+    let one_shots = one_shots_for_current_identity(load_one_shots_at(&sidecar_path)?)?;
     build_from_current_counters(&state, &observed, &one_shots.queued)
 }
 
@@ -769,6 +785,7 @@ fn load_state_at(path: &std::path::Path) -> Result<AggregateState, String> {
     }
 }
 
+#[cfg(test)]
 fn load_one_shots() -> Result<OneShotState, String> {
     let path = one_shot_path()?;
     ensure_parent(&path)?;
@@ -1211,6 +1228,38 @@ mod tests {
         acknowledge_daily_batch(&pending).expect("acknowledge");
         let next = preview_daily_batch().expect("next preview");
         assert_eq!(tool_counts(&next), (1, 1));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn preview_fails_fast_during_send_then_preserves_concurrent_counts() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        record_sync_result(false).expect("record included failure");
+        let lease = begin_daily_send().expect("begin send");
+        let error = preview_daily_batch().expect_err("preview must not race a send");
+        assert!(error.contains("send is in progress"));
+        record_sync_result(true).expect("record concurrent success");
+        lease.commit().expect("commit included failure");
+        let preview = preview_daily_batch().expect("preview after send");
+        assert_eq!(sync_counts(&preview), Some((1, 1, 0)));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn preview_fails_fast_during_sidecar_write_and_recovers() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        record_sync_result(true).expect("record result");
+        {
+            let path = one_shot_path().expect("sidecar path");
+            let lock = open_sidecar_lock(&path).expect("open lock");
+            lock.lock_exclusive().expect("hold writer lock");
+            let error = preview_daily_batch().expect_err("preview must not wait for writer");
+            assert!(error.contains("cannot lock one-shot state"));
+        }
+        assert_eq!(
+            sync_counts(&preview_daily_batch().expect("preview after writer exits")),
+            Some((1, 1, 0))
+        );
     }
 
     #[test]

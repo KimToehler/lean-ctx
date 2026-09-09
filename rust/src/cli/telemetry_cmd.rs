@@ -53,6 +53,8 @@ pub(super) fn cmd_telemetry(args: &[String]) {
         "reset-id" => reset_id(),
         "show" | "pending" => show_payload(),
         "history" | "log" => show_history(),
+        "purge-local" => purge_local(),
+        "delete-remote" => delete_remote(),
         "--help" | "-h" => print_help(),
         other => {
             eprintln!("telemetry: unknown subcommand '{other}'");
@@ -200,6 +202,33 @@ fn show_history() {
     );
 }
 
+fn purge_local() {
+    match crate::core::telemetry_ledger::purge_local() {
+        Ok(()) => println!("Local telemetry history purged."),
+        Err(error) => {
+            eprintln!("Failed to purge local telemetry history: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn delete_remote() {
+    let installation_id = match installation_id::get_or_create() {
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("Failed to read installation ID: {error}");
+            std::process::exit(1);
+        }
+    };
+    match crate::cloud_client::delete_remote_telemetry(&installation_id) {
+        Ok(()) => println!("Remote telemetry for this installation was deleted."),
+        Err(error) => {
+            eprintln!("Failed to delete remote telemetry: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn print_help() {
     println!("Usage: lean-ctx telemetry [subcommand]");
     println!();
@@ -213,6 +242,8 @@ fn print_help() {
     println!("  pending    Display the exact typed batch currently eligible for sending");
     println!("  reset-id   Regenerate the anonymous installation ID");
     println!("  history    Show log of all sent heartbeats");
+    println!("  purge-local Delete the local telemetry history");
+    println!("  delete-remote Delete server-side telemetry for this installation");
     println!();
     println!("The heartbeat sends: version, OS, architecture, compression patterns,");
     println!("and a random install UUID. No code, filenames, or personal data — ever.");

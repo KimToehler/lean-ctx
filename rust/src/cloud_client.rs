@@ -484,6 +484,20 @@ pub fn telemetry_v2_batch(
     Ok(json["message"].as_str().unwrap_or("OK").to_string())
 }
 
+/// Delete every server-side aggregate associated with one installation ID.
+pub fn delete_remote_telemetry(installation_id: &str) -> Result<(), String> {
+    let installation_id = uuid::Uuid::parse_str(installation_id)
+        .map_err(|_| "Invalid installation ID".to_string())?;
+    let url = format!(
+        "{}/api/telemetry/v2/installations/{installation_id}",
+        api_url()
+    );
+    ureq::delete(&url)
+        .call()
+        .map_err(|error| format!("Remote telemetry deletion failed: {error}"))?;
+    Ok(())
+}
+
 /// Result of a successful Wrapped publish (`POST /api/wrapped`). The `edit_token` is returned
 /// (and must be stored to delete/claim later) only on a *fresh* insert; on a signed re-publish
 /// the server updates the existing card in place and omits it (the client keeps the stored one).

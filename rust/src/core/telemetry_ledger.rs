@@ -56,6 +56,15 @@ pub(crate) fn read_all() -> Vec<HeartbeatRecord> {
         .collect()
 }
 
+pub(crate) fn purge_local() -> Result<(), String> {
+    let path = ledger_path()?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Cannot purge telemetry ledger: {error}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +85,7 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].installation_id, "test-uuid-1234");
         assert_eq!(all[1].version, "3.9.13");
+        purge_local().expect("purge ledger");
+        assert!(read_all().is_empty());
     }
 }

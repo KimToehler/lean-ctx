@@ -47,6 +47,8 @@ struct OneShotState {
     setup_recorded: bool,
     configured_integrations: BTreeSet<String>,
     observed_major: Option<u16>,
+    #[serde(default)]
+    last_acknowledged_batch: Option<String>,
     queued: QueuedOneShots,
 }
 
@@ -75,6 +77,8 @@ struct VersionTransition {
 #[serde(deny_unknown_fields)]
 struct PendingBatch {
     batch: TelemetryBatchV2,
+    #[serde(default)]
+    acknowledgement_id: String,
     observed: CounterCheckpoint,
     process_nonce: String,
     #[serde(default)]
@@ -95,15 +99,16 @@ impl DailySendLease {
 
     pub fn commit(self) -> Result<(), String> {
         let current_state = load_state_at(&self.state_path)?;
-        let included = current_state
+        let pending = current_state
             .pending
             .as_ref()
-            .ok_or_else(|| "no prepared telemetry batch to acknowledge".to_string())?
-            .included_one_shots
-            .clone();
+            .ok_or_else(|| "no prepared telemetry batch to acknowledge".to_string())?;
+        let included = pending.included_one_shots.clone();
+        let acknowledgement_id = pending_acknowledgement_id(pending)?;
         let state = acknowledge_state(current_state, &self.batch)?;
+        acknowledge_one_shots_at(&self.one_shot_path, &included, &acknowledgement_id)?;
         write_state(&self.state_path, &state)?;
-        acknowledge_one_shots_at(&self.one_shot_path, &included)
+        Ok(())
     }
 }
 
@@ -135,6 +140,7 @@ fn prepare_daily_batch() -> Result<TelemetryBatchV2, String> {
         state.installation_id = batch_installation_id(&batch).to_string();
         state.pending = Some(PendingBatch {
             batch: batch.clone(),
+            acknowledgement_id: uuid::Uuid::new_v4().to_string(),
             observed,
             process_nonce: process_nonce().to_string(),
             included_one_shots: one_shots.queued,
@@ -166,6 +172,7 @@ pub fn begin_daily_send() -> Result<DailySendLease, String> {
         state.installation_id = batch_installation_id(&batch).to_string();
         state.pending = Some(PendingBatch {
             batch: batch.clone(),
+            acknowledgement_id: uuid::Uuid::new_v4().to_string(),
             observed,
             process_nonce: process_nonce().to_string(),
             included_one_shots: one_shots.queued,
@@ -190,15 +197,25 @@ fn acknowledge_daily_batch(batch: &TelemetryBatchV2) -> Result<(), String> {
     lock.lock_exclusive()
         .map_err(|error| format!("cannot lock telemetry aggregate state: {error}"))?;
     let state = load_state_at(&path)?;
-    let included = state
+    let pending = state
         .pending
         .as_ref()
-        .ok_or_else(|| "no prepared telemetry batch to acknowledge".to_string())?
-        .included_one_shots
-        .clone();
+        .ok_or_else(|| "no prepared telemetry batch to acknowledge".to_string())?;
+    let included = pending.included_one_shots.clone();
+    let acknowledgement_id = pending_acknowledgement_id(pending)?;
     let state = acknowledge_state(state, batch)?;
+    acknowledge_one_shots_at(&one_shot_path()?, &included, &acknowledgement_id)?;
     write_state(&path, &state)?;
-    acknowledge_one_shots_at(&one_shot_path()?, &included)
+    Ok(())
+}
+
+fn pending_acknowledgement_id(pending: &PendingBatch) -> Result<String, String> {
+    if !pending.acknowledgement_id.is_empty() {
+        return Ok(pending.acknowledgement_id.clone());
+    }
+    let encoded = serde_json::to_vec(&pending.batch)
+        .map_err(|error| format!("cannot encode telemetry acknowledgement: {error}"))?;
+    Ok(hex::encode(sha2::Sha256::digest(encoded)))
 }
 
 fn acknowledge_state(
@@ -656,6 +673,7 @@ pub fn rotate_identity_state_then<T>(
     one_shots.queued.sync = SyncMetrics::default();
     one_shots.queued.autopilot = DecisionMetrics::default();
     one_shots.queued.autopilot_fallback = DecisionMetrics::default();
+    one_shots.last_acknowledged_batch = None;
     remove_state_file(&path, "aggregate")?;
     write_one_shots(&one_shot_path, &one_shots)?;
     Ok(value)
@@ -718,6 +736,7 @@ fn one_shots_for_current_identity(mut state: OneShotState) -> Result<OneShotStat
         state.queued.sync = SyncMetrics::default();
         state.queued.autopilot = DecisionMetrics::default();
         state.queued.autopilot_fallback = DecisionMetrics::default();
+        state.last_acknowledged_batch = None;
     }
     Ok(state)
 }
@@ -739,12 +758,16 @@ fn with_locked_one_shots<T>(
 fn acknowledge_one_shots_at(
     path: &std::path::Path,
     included: &QueuedOneShots,
+    acknowledgement_id: &str,
 ) -> Result<(), String> {
     ensure_parent(path)?;
     let lock = open_sidecar_lock(path)?;
     lock.lock_exclusive()
         .map_err(|error| format!("cannot lock telemetry one-shot state: {error}"))?;
     let mut state = one_shots_for_current_identity(load_one_shots_at(path)?)?;
+    if state.last_acknowledged_batch.as_deref() == Some(acknowledgement_id) {
+        return Ok(());
+    }
     if included.setup_completed {
         state.queued.setup_completed = false;
     }
@@ -786,6 +809,7 @@ fn acknowledge_one_shots_at(
             current => current,
         };
     }
+    state.last_acknowledged_batch = Some(acknowledgement_id.to_string());
     write_one_shots(path, &state)
 }
 
@@ -1261,6 +1285,61 @@ mod tests {
         assert_eq!(
             sync_counts(&preview_daily_batch().expect("residual preview")),
             Some((1, 1, 0))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn retry_after_sidecar_ack_crash_does_not_double_subtract_one_shots() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        record_sync_result(true).expect("record included sync result");
+        record_autopilot_decisions(1, 0).expect("record included decision");
+        let pending = prepare_daily_batch().expect("prepare pending batch");
+        let aggregate_path = state_path().expect("aggregate path");
+        let state = load_state_at(&aggregate_path).expect("load pending state");
+        let pending_state = state.pending.expect("pending batch");
+        let acknowledgement_id =
+            pending_acknowledgement_id(&pending_state).expect("compute acknowledgement id");
+        let included = pending_state.included_one_shots;
+
+        // Simulate a crash after the sidecar subtraction was persisted but before
+        // the aggregate pending marker was cleared.
+        acknowledge_one_shots_at(
+            &one_shot_path().expect("one-shot path"),
+            &included,
+            &acknowledgement_id,
+        )
+        .expect("persist sidecar acknowledgement");
+        record_sync_result(false).expect("record result after interrupted commit");
+        record_autopilot_decisions(0, 1).expect("record decision after interrupted commit");
+
+        acknowledge_daily_batch(&pending).expect("retry acknowledgement");
+        let residual = preview_daily_batch().expect("residual preview");
+        assert_eq!(sync_counts(&residual), Some((1, 0, 1)));
+        assert_eq!(autopilot_counts(&residual), Some((0, 1, 0)));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn distinct_pending_instances_with_identical_metrics_are_each_acknowledged() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        record_sync_result(true).expect("record first result");
+        let first = prepare_daily_batch().expect("prepare first batch");
+        let first_state = load_state().expect("load first state");
+        let first_pending = first_state.pending.expect("first pending");
+        let first_id = pending_acknowledgement_id(&first_pending).expect("first id");
+        acknowledge_daily_batch(&first).expect("ack first batch");
+
+        record_sync_result(true).expect("record identical second result");
+        let second = prepare_daily_batch().expect("prepare second batch");
+        let second_state = load_state().expect("load second state");
+        let second_pending = second_state.pending.expect("second pending");
+        let second_id = pending_acknowledgement_id(&second_pending).expect("second id");
+        assert_ne!(first_id, second_id);
+        acknowledge_daily_batch(&second).expect("ack second batch");
+        assert_eq!(
+            sync_counts(&preview_daily_batch().expect("final preview")),
+            None
         );
     }
 

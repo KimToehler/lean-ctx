@@ -1,6 +1,7 @@
 //! Telemetry and metrics collection following OpenTelemetry GenAI conventions.
 //!
-//! Provides lock-free, zero-allocation metrics collection for:
+//! Provides zero-allocation metrics collection with a short consistency lock
+//! around tool-call counters so daily snapshots cannot lose partial updates:
 //! - Token usage (input, output, saved, compression ratio)
 //! - Tool call latency and success rates
 //! - Search quality metrics (latency, result counts)
@@ -16,12 +17,16 @@ use std::time::Instant;
 
 static METRICS: OnceLock<Metrics> = OnceLock::new();
 
+pub(crate) const TOOL_LATENCY_BUCKET_UPPER_MS: [u64; 9] =
+    [10, 50, 100, 250, 500, 1_000, 5_000, 60_000, i64::MAX as u64];
+
 pub fn global_metrics() -> &'static Metrics {
     METRICS.get_or_init(Metrics::new)
 }
 
 #[derive(Debug)]
 pub struct Metrics {
+    tool_call_consistency: std::sync::Mutex<()>,
     // gen_ai.usage.input_tokens / gen_ai.usage.output_tokens
     pub tokens_input: AtomicU64,
     pub tokens_output: AtomicU64,
@@ -30,6 +35,7 @@ pub struct Metrics {
     pub tool_calls_total: AtomicU64,
     pub tool_calls_error: AtomicU64,
     pub tool_call_latency_sum_us: AtomicU64,
+    tool_call_latency_buckets: [AtomicU64; TOOL_LATENCY_BUCKET_UPPER_MS.len()],
 
     pub search_queries_total: AtomicU64,
     pub search_latency_sum_us: AtomicU64,
@@ -52,12 +58,14 @@ pub struct Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self {
+            tool_call_consistency: std::sync::Mutex::new(()),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             tokens_saved: AtomicU64::new(0),
             tool_calls_total: AtomicU64::new(0),
             tool_calls_error: AtomicU64::new(0),
             tool_call_latency_sum_us: AtomicU64::new(0),
+            tool_call_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             search_queries_total: AtomicU64::new(0),
             search_latency_sum_us: AtomicU64::new(0),
             search_results_total: AtomicU64::new(0),
@@ -80,9 +88,19 @@ impl Metrics {
     }
 
     pub fn record_tool_call(&self, latency_us: u64, success: bool) {
+        let _guard = self
+            .tool_call_consistency
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.tool_calls_total.fetch_add(1, Ordering::Relaxed);
         self.tool_call_latency_sum_us
             .fetch_add(latency_us, Ordering::Relaxed);
+        let latency_ms = latency_us / 1_000;
+        let bucket = TOOL_LATENCY_BUCKET_UPPER_MS
+            .iter()
+            .position(|upper| latency_ms <= *upper)
+            .unwrap_or(TOOL_LATENCY_BUCKET_UPPER_MS.len() - 1);
+        self.tool_call_latency_buckets[bucket].fetch_add(1, Ordering::Relaxed);
         if !success {
             self.tool_calls_error.fetch_add(1, Ordering::Relaxed);
         }
@@ -178,6 +196,21 @@ impl Metrics {
         }
     }
 
+    pub(crate) fn daily_telemetry_snapshot(&self) -> DailyTelemetrySnapshot {
+        let _guard = self
+            .tool_call_consistency
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        DailyTelemetrySnapshot {
+            tool_calls: self.tool_calls_total.load(Ordering::Relaxed),
+            tool_failures: self.tool_calls_error.load(Ordering::Relaxed),
+            tool_latency_buckets: std::array::from_fn(|index| {
+                self.tool_call_latency_buckets[index].load(Ordering::Relaxed)
+            }),
+            session_uptime_secs: self.session_start.elapsed().as_secs(),
+        }
+    }
+
     /// Format as OpenTelemetry-compatible attributes for logging.
     pub fn to_otel_attributes(&self) -> Vec<(&'static str, String)> {
         let snap = self.snapshot();
@@ -227,6 +260,14 @@ impl Metrics {
             ),
         ]
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DailyTelemetrySnapshot {
+    pub tool_calls: u64,
+    pub tool_failures: u64,
+    pub tool_latency_buckets: [u64; TOOL_LATENCY_BUCKET_UPPER_MS.len()],
+    pub session_uptime_secs: u64,
 }
 
 /// Point-in-time snapshot of all metrics.
@@ -561,6 +602,39 @@ mod tests {
         assert_eq!(snap.tool_calls_total, 2);
         assert_eq!(snap.tool_calls_error, 1);
         assert!(snap.tool_call_avg_latency_ms > 0.0);
+    }
+
+    #[test]
+    fn concurrent_daily_snapshot_never_observes_partial_tool_call() {
+        let metrics = std::sync::Arc::new(Metrics::new());
+        let writers = (0..4)
+            .map(|worker| {
+                let metrics = std::sync::Arc::clone(&metrics);
+                std::thread::spawn(move || {
+                    for call in 0..1_000 {
+                        metrics.record_tool_call((call + 1) * 1_000, (call + worker) % 3 != 0);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        while writers.iter().any(|writer| !writer.is_finished()) {
+            let snapshot = metrics.daily_telemetry_snapshot();
+            assert_eq!(
+                snapshot.tool_latency_buckets.iter().sum::<u64>(),
+                snapshot.tool_calls
+            );
+            assert!(snapshot.tool_failures <= snapshot.tool_calls);
+        }
+        for writer in writers {
+            writer.join().expect("writer");
+        }
+        let snapshot = metrics.daily_telemetry_snapshot();
+        assert_eq!(snapshot.tool_calls, 4_000);
+        assert_eq!(
+            snapshot.tool_latency_buckets.iter().sum::<u64>(),
+            snapshot.tool_calls
+        );
+        assert!(snapshot.tool_failures <= snapshot.tool_calls);
     }
 
     #[test]

@@ -143,7 +143,7 @@ fn reset_id() {
             std::process::exit(1);
         }
     }
-    match installation_id::reset() {
+    match crate::core::telemetry_aggregate::purge_local_state_then(installation_id::reset) {
         Ok(new_id) => {
             println!(
                 "Installation ID regenerated: {}",
@@ -214,6 +214,16 @@ fn show_history() {
             "  {:<28} {:<12} {:<10} {}",
             record.timestamp, record.version, record.os, record.arch,
         );
+        if record.schema_version > 0 {
+            println!(
+                "    schema={} status={} events={} hash={} endpoint={}",
+                record.schema_version,
+                record.status,
+                record.event_names.join(","),
+                record.payload_hash,
+                record.endpoint
+            );
+        }
     }
     println!();
     println!(
@@ -223,7 +233,9 @@ fn show_history() {
 }
 
 fn purge_local() {
-    match crate::core::telemetry_ledger::purge_local() {
+    match crate::core::telemetry_ledger::purge_local()
+        .and_then(|()| crate::core::telemetry_aggregate::purge_local_state())
+    {
         Ok(()) => println!("Local telemetry history purged."),
         Err(error) => {
             eprintln!("Failed to purge local telemetry history: {error}");
@@ -241,13 +253,19 @@ fn delete_remote() {
         }
     };
     match crate::cloud_client::delete_remote_telemetry(&installation_id, &deletion_token) {
-        Ok(true) => match installation_id::reset() {
-            Ok(_) => println!("Remote telemetry was deleted and the local identity was rotated."),
-            Err(error) => {
-                eprintln!("Remote telemetry deleted, but local identity rotation failed: {error}");
-                std::process::exit(1);
+        Ok(true) => {
+            match crate::core::telemetry_aggregate::purge_local_state_then(installation_id::reset) {
+                Ok(_) => {
+                    println!("Remote telemetry was deleted and the local identity was rotated.");
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Remote telemetry deleted, but local identity rotation failed: {error}"
+                    );
+                    std::process::exit(1);
+                }
             }
-        },
+        }
         Ok(false) => {
             eprintln!(
                 "Remote telemetry was not deleted; send one current v2 batch first to register the deletion credential."

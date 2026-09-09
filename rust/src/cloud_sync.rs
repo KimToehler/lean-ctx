@@ -85,7 +85,8 @@ pub fn cloud_background_tasks() {
         .telemetry
         .last_heartbeat
         .as_deref()
-        .is_some_and(|d| d == today);
+        .is_some_and(|d| d == today)
+        || crate::core::telemetry_aggregate::last_sent_bucket().as_deref() == Some(&today);
     let already_synced = config
         .cloud
         .last_sync
@@ -110,22 +111,43 @@ pub fn cloud_background_tasks() {
         .send_eligible(do_not_track.as_deref(), telemetry_override.as_deref())
         && !already_heartbeated
     {
-        if let Ok(batch) = crate::core::telemetry_aggregate::pending_daily_batch() {
+        if let Ok(lease) = crate::core::telemetry_aggregate::begin_daily_send() {
+            let batch = lease.batch().clone();
             let installation_id = batch
                 .events
                 .first()
                 .map(|event| event.installation_id.clone());
-            if crate::cloud_client::telemetry_v2_batch(&batch).is_ok() {
-                config.telemetry.last_heartbeat = Some(today.clone());
-                if let Some(installation_id) = installation_id {
-                    let record = crate::core::telemetry_ledger::HeartbeatRecord {
+            if let Ok(payload) = serde_json::to_vec(&batch)
+                && crate::cloud_client::telemetry_v2_batch(&batch).is_ok()
+            {
+                use sha2::Digest;
+                let payload_hash = hex::encode(sha2::Sha256::digest(payload));
+                let record = installation_id.map(|installation_id| {
+                    crate::core::telemetry_ledger::HeartbeatRecord {
                         timestamp: chrono::Utc::now().to_rfc3339(),
                         installation_id,
                         version: env!("CARGO_PKG_VERSION").to_string(),
                         os: std::env::consts::OS.to_string(),
                         arch: std::env::consts::ARCH.to_string(),
-                    };
-                    let _ = crate::core::telemetry_ledger::append(&record);
+                        schema_version: batch.schema_version,
+                        event_names: batch
+                            .events
+                            .iter()
+                            .map(|event| event.event.name().to_string())
+                            .collect(),
+                        payload_hash,
+                        endpoint: telemetry_ledger_endpoint(),
+                        status: "success".to_string(),
+                    }
+                });
+                let ledger_committed = record
+                    .as_ref()
+                    .is_some_and(|record| crate::core::telemetry_ledger::append(record).is_ok());
+                if ledger_committed && lease.commit().is_ok() {
+                    config.telemetry.last_heartbeat = batch
+                        .events
+                        .first()
+                        .map(|event| event.timestamp_bucket.clone());
                 }
             }
         }
@@ -230,6 +252,27 @@ pub fn cloud_background_tasks() {
     if let Err(e) = config.save() {
         tracing::warn!("could not persist cloud background state: {e}");
     }
+}
+
+fn telemetry_ledger_endpoint() -> String {
+    let raw =
+        std::env::var("LEAN_CTX_API_URL").unwrap_or_else(|_| "https://api.leanctx.com".to_string());
+    sanitized_telemetry_endpoint(&raw)
+}
+
+fn sanitized_telemetry_endpoint(raw: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return "https://api.leanctx.com/api/telemetry/v2/batch".to_string();
+    };
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return "https://api.leanctx.com/api/telemetry/v2/batch".to_string();
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.set_path("/api/telemetry/v2/batch");
+    url.to_string()
 }
 
 /// Push every Personal-Cloud surface silently (background variant of
@@ -646,6 +689,18 @@ pub fn collect_contribute_entries() -> Vec<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn telemetry_ledger_endpoint_removes_credentials_query_and_fragment() {
+        assert_eq!(
+            sanitized_telemetry_endpoint("https://user:secret@example.test/base?token=x#private"),
+            "https://example.test/api/telemetry/v2/batch"
+        );
+        assert_eq!(
+            sanitized_telemetry_endpoint("file:///private/path"),
+            "https://api.leanctx.com/api/telemetry/v2/batch"
+        );
+    }
 
     #[test]
     fn auto_sync_requires_flag_login_and_unused_slot() {

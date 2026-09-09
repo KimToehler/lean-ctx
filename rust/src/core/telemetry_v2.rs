@@ -135,6 +135,31 @@ pub enum TelemetryEventV2 {
 }
 
 impl TelemetryEventV2 {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Heartbeat(_) => "heartbeat",
+            Self::SetupCompleted(_) => "setup_completed",
+            Self::IntegrationDetected(_) => "integration_detected",
+            Self::SessionAggregate(_) => "session_aggregate",
+            Self::ToolUsageAggregate(_) => "tool_usage_aggregate",
+            Self::AutopilotAggregate(_) => "autopilot_aggregate",
+            Self::AutopilotFallbackAggregate(_) => "autopilot_fallback_aggregate",
+            Self::SyncAggregate(_) => "sync_aggregate",
+            Self::TrialStarted(_) => "trial_started",
+            Self::TrialEnded(_) => "trial_ended",
+            Self::UpgradeViewed(_) => "upgrade_viewed",
+            Self::CheckoutStarted(_) => "checkout_started",
+            Self::SubscriptionActivated(_) => "subscription_activated",
+            Self::SubscriptionCancelled(_) => "subscription_cancelled",
+            Self::TeamCreated(_) => "team_created",
+            Self::TeamMemberInvited(_) => "team_member_invited",
+            Self::TeamContextPromoted(_) => "team_context_promoted",
+            Self::ErrorCategoryAggregate(_) => "error_category_aggregate",
+            Self::VersionUpgrade(_) => "version_upgrade",
+            Self::OrchestrationAggregate(_) => "orchestration_aggregate",
+        }
+    }
+
     fn validate(&self) -> Result<(), TelemetryValidationError> {
         match self {
             Self::Heartbeat(metrics) => metrics.validate(),

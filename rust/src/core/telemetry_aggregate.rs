@@ -1,6 +1,7 @@
 //! Privacy-safe daily telemetry aggregation.
 
 use sha2::Digest;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -10,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use super::installation_id;
 use super::telemetry_v2::{
     Architecture, ClientFamily, DistributionChannel, HeartbeatMetrics, Histogram, MAX_COUNT,
-    OperatingSystem, SCHEMA_VERSION, SessionMetrics, TelemetryBatchV2, TelemetryEnvelopeV2,
-    TelemetryEventV2, ToolUsageMetrics,
+    OccurrenceMetrics, OperatingSystem, SCHEMA_VERSION, SessionMetrics, TelemetryBatchV2,
+    TelemetryEnvelopeV2, TelemetryEventV2, ToolUsageMetrics, VersionUpgradeMetrics,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -26,11 +27,37 @@ struct CounterCheckpoint {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AggregateState {
+    #[serde(default)]
+    installation_id: String,
     process_nonce: String,
     acknowledged: CounterCheckpoint,
     pending: Option<PendingBatch>,
     #[serde(default)]
     last_sent_bucket: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OneShotState {
+    setup_recorded: bool,
+    configured_integrations: BTreeSet<String>,
+    observed_major: Option<u16>,
+    queued: QueuedOneShots,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueuedOneShots {
+    setup_completed: bool,
+    integrations_detected: u64,
+    version_upgrade: Option<VersionTransition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionTransition {
+    from_major: u16,
+    to_major: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,11 +66,14 @@ struct PendingBatch {
     batch: TelemetryBatchV2,
     observed: CounterCheckpoint,
     process_nonce: String,
+    #[serde(default)]
+    included_one_shots: QueuedOneShots,
 }
 
 pub struct DailySendLease {
     batch: TelemetryBatchV2,
     state_path: PathBuf,
+    one_shot_path: PathBuf,
     _lock: std::fs::File,
 }
 
@@ -53,8 +83,16 @@ impl DailySendLease {
     }
 
     pub fn commit(self) -> Result<(), String> {
-        let state = acknowledge_state(load_state_at(&self.state_path)?, &self.batch)?;
-        write_state(&self.state_path, &state)
+        let current_state = load_state_at(&self.state_path)?;
+        let included = current_state
+            .pending
+            .as_ref()
+            .ok_or_else(|| "no prepared telemetry batch to acknowledge".to_string())?
+            .included_one_shots
+            .clone();
+        let state = acknowledge_state(current_state, &self.batch)?;
+        write_state(&self.state_path, &state)?;
+        acknowledge_one_shots_at(&self.one_shot_path, &included)
     }
 }
 
@@ -64,12 +102,13 @@ pub fn pending_daily_batch() -> Result<TelemetryBatchV2, String> {
 
 /// Build the exact currently eligible payload without advancing durable state.
 pub fn preview_daily_batch() -> Result<TelemetryBatchV2, String> {
-    let state = load_state()?;
+    let state = state_for_current_identity(load_state()?)?;
     if let Some(pending) = state.pending {
         return Ok(pending.batch);
     }
     let observed = current_checkpoint();
-    build_from_current_counters(&state, &observed)
+    let one_shots = load_one_shots()?;
+    build_from_current_counters(&state, &observed, &one_shots.queued)
 }
 
 /// Freeze one payload until the sender explicitly acknowledges success.
@@ -80,11 +119,14 @@ fn prepare_daily_batch() -> Result<TelemetryBatchV2, String> {
             return Ok((state.clone(), pending.batch.clone()));
         }
         let observed = current_checkpoint();
-        let batch = build_from_current_counters(&state, &observed)?;
+        let one_shots = load_one_shots()?;
+        let batch = build_from_current_counters(&state, &observed, &one_shots.queued)?;
+        state.installation_id = batch_installation_id(&batch).to_string();
         state.pending = Some(PendingBatch {
             batch: batch.clone(),
             observed,
             process_nonce: process_nonce().to_string(),
+            included_one_shots: one_shots.queued,
         });
         Ok((state, batch))
     })
@@ -93,20 +135,29 @@ fn prepare_daily_batch() -> Result<TelemetryBatchV2, String> {
 /// Hold the cross-process state lease until network, ledger, and acknowledgement finish.
 pub fn begin_daily_send() -> Result<DailySendLease, String> {
     let path = state_path()?;
+    let one_shot_path = one_shot_path()?;
     ensure_parent(&path)?;
     let lock = open_state_lock(&path)?;
     lock.lock_exclusive()
         .map_err(|error| format!("cannot lock telemetry aggregate state: {error}"))?;
-    let mut state = load_state()?;
+    let mut state = state_for_current_identity(load_state()?)?;
     let batch = if let Some(pending) = &state.pending {
         pending.batch.clone()
     } else {
+        ensure_parent(&one_shot_path)?;
+        let one_shot_lock = open_sidecar_lock(&one_shot_path)?;
+        one_shot_lock
+            .lock_exclusive()
+            .map_err(|error| format!("cannot lock telemetry one-shot state: {error}"))?;
+        let one_shots = load_one_shots_at(&one_shot_path)?;
         let observed = current_checkpoint();
-        let batch = build_from_current_counters(&state, &observed)?;
+        let batch = build_from_current_counters(&state, &observed, &one_shots.queued)?;
+        state.installation_id = batch_installation_id(&batch).to_string();
         state.pending = Some(PendingBatch {
             batch: batch.clone(),
             observed,
             process_nonce: process_nonce().to_string(),
+            included_one_shots: one_shots.queued,
         });
         write_state(&path, &state)?;
         batch
@@ -114,6 +165,7 @@ pub fn begin_daily_send() -> Result<DailySendLease, String> {
     Ok(DailySendLease {
         batch,
         state_path: path,
+        one_shot_path,
         _lock: lock,
     })
 }
@@ -121,7 +173,21 @@ pub fn begin_daily_send() -> Result<DailySendLease, String> {
 /// Advance counters only when the exact frozen payload was accepted remotely.
 #[cfg(test)]
 fn acknowledge_daily_batch(batch: &TelemetryBatchV2) -> Result<(), String> {
-    with_locked_state(|state| Ok((acknowledge_state(state, batch)?, ())))
+    let path = state_path()?;
+    ensure_parent(&path)?;
+    let lock = open_state_lock(&path)?;
+    lock.lock_exclusive()
+        .map_err(|error| format!("cannot lock telemetry aggregate state: {error}"))?;
+    let state = load_state_at(&path)?;
+    let included = state
+        .pending
+        .as_ref()
+        .ok_or_else(|| "no prepared telemetry batch to acknowledge".to_string())?
+        .included_one_shots
+        .clone();
+    let state = acknowledge_state(state, batch)?;
+    write_state(&path, &state)?;
+    acknowledge_one_shots_at(&one_shot_path()?, &included)
 }
 
 fn acknowledge_state(
@@ -145,12 +211,41 @@ fn acknowledge_state(
 }
 
 pub fn last_sent_bucket() -> Option<String> {
-    load_state().ok().and_then(|state| state.last_sent_bucket)
+    load_state()
+        .and_then(state_for_current_identity)
+        .ok()
+        .and_then(|state| state.last_sent_bucket)
+}
+
+fn state_for_current_identity(mut state: AggregateState) -> Result<AggregateState, String> {
+    let (current, _) = installation_id::get_or_create_identity()
+        .map_err(|error| format!("installation ID unavailable: {error}"))?;
+    let pending_mismatch = state.pending.as_ref().is_some_and(|pending| {
+        let pending_id = batch_installation_id(&pending.batch);
+        pending_id.is_empty() || pending_id != current
+    });
+    if pending_mismatch || (!state.installation_id.is_empty() && state.installation_id != current) {
+        state = AggregateState {
+            installation_id: current,
+            ..AggregateState::default()
+        };
+    } else if state.installation_id.is_empty() {
+        state.installation_id = current;
+    }
+    Ok(state)
+}
+
+fn batch_installation_id(batch: &TelemetryBatchV2) -> &str {
+    batch
+        .events
+        .first()
+        .map_or("", |event| event.installation_id.as_str())
 }
 
 fn build_from_current_counters(
     state: &AggregateState,
     observed: &CounterCheckpoint,
+    queued: &QueuedOneShots,
 ) -> Result<TelemetryBatchV2, String> {
     let (installation_id, deletion_token) = installation_id::get_or_create_identity()
         .map_err(|error| format!("installation ID unavailable: {error}"))?;
@@ -163,6 +258,7 @@ fn build_from_current_counters(
         client_family(),
         state,
         observed,
+        queued,
     )
 }
 
@@ -174,6 +270,7 @@ fn build_daily_aggregate(
     client_family: ClientFamily,
     state: &AggregateState,
     observed: &CounterCheckpoint,
+    queued: &QueuedOneShots,
 ) -> Result<TelemetryBatchV2, String> {
     let empty = CounterCheckpoint::default();
     let baseline = if state.process_nonce == process_nonce() {
@@ -241,6 +338,29 @@ fn build_daily_aggregate(
             },
         }),
     ));
+    if queued.setup_completed {
+        batch.events.push(envelope_like(
+            &common,
+            TelemetryEventV2::SetupCompleted(OccurrenceMetrics { count: 1 }),
+        ));
+    }
+    if queued.integrations_detected > 0 {
+        batch.events.push(envelope_like(
+            &common,
+            TelemetryEventV2::IntegrationDetected(OccurrenceMetrics {
+                count: queued.integrations_detected.min(MAX_COUNT),
+            }),
+        ));
+    }
+    if let Some(transition) = queued.version_upgrade {
+        batch.events.push(envelope_like(
+            &common,
+            TelemetryEventV2::VersionUpgrade(VersionUpgradeMetrics {
+                from_major: transition.from_major,
+                to_major: transition.to_major,
+            }),
+        ));
+    }
     batch
         .validate()
         .map_err(|error| format!("invalid telemetry batch: {error:?}"))?;
@@ -302,6 +422,85 @@ fn state_path() -> Result<PathBuf, String> {
     crate::core::paths::state_dir().map(|dir| dir.join("telemetry_v2_aggregate.json"))
 }
 
+fn one_shot_path() -> Result<PathBuf, String> {
+    crate::core::paths::state_dir().map(|dir| dir.join("telemetry_v2_one_shots.json"))
+}
+
+pub fn record_setup_completion(
+    integration_ids: impl IntoIterator<Item = String>,
+) -> Result<(), String> {
+    let config = crate::core::config::Config::load_global();
+    let do_not_track = std::env::var("DO_NOT_TRACK").ok();
+    let telemetry_override = std::env::var("LEAN_CTX_TELEMETRY").ok();
+    if config.telemetry.explicitly_disabled()
+        || crate::core::config::TelemetryConfig::environment_disables(
+            do_not_track.as_deref(),
+            telemetry_override.as_deref(),
+        )
+    {
+        return Ok(());
+    }
+    with_locked_one_shots(|mut state| {
+        if !state.setup_recorded {
+            state.setup_recorded = true;
+            state.queued.setup_completed = true;
+        }
+        for integration_id in integration_ids {
+            if state.configured_integrations.len() >= 64 {
+                break;
+            }
+            if integration_id.is_empty() || integration_id.len() > 128 {
+                continue;
+            }
+            let stable_id = hex::encode(sha2::Sha256::digest(integration_id.as_bytes()));
+            if state.configured_integrations.insert(stable_id) {
+                state.queued.integrations_detected = state
+                    .queued
+                    .integrations_detected
+                    .saturating_add(1)
+                    .min(MAX_COUNT);
+            }
+        }
+        Ok((state, ()))
+    })
+}
+
+pub fn record_current_version() -> Result<(), String> {
+    record_current_version_value(env!("CARGO_PKG_VERSION"))
+}
+
+fn record_current_version_value(version: &str) -> Result<(), String> {
+    let current = parse_major(version)
+        .ok_or_else(|| "current app version has no valid major component".to_string())?;
+    with_locked_one_shots(|mut state| {
+        let previous = state.observed_major.or_else(|| {
+            crate::core::telemetry_ledger::latest_valid_version()
+                .as_deref()
+                .and_then(parse_major)
+        });
+        match previous {
+            Some(previous) if current > previous => {
+                let from_major = state
+                    .queued
+                    .version_upgrade
+                    .map_or(previous, |transition| transition.from_major);
+                state.queued.version_upgrade = Some(VersionTransition {
+                    from_major,
+                    to_major: current,
+                });
+                state.observed_major = Some(current);
+            }
+            Some(previous) => state.observed_major = Some(previous.max(current)),
+            None => state.observed_major = Some(current),
+        }
+        Ok((state, ()))
+    })
+}
+
+fn parse_major(version: &str) -> Option<u16> {
+    version.split('.').next()?.parse().ok()
+}
+
 pub fn purge_local_state() -> Result<(), String> {
     purge_local_state_then(|| Ok(()))
 }
@@ -314,12 +513,50 @@ pub fn purge_local_state_then<T>(
     let lock = open_state_lock(&path)?;
     lock.lock_exclusive()
         .map_err(|error| format!("cannot lock telemetry aggregate state: {error}"))?;
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("cannot purge telemetry aggregate state: {error}")),
-    }
+    let one_shot_path = one_shot_path()?;
+    ensure_parent(&one_shot_path)?;
+    let one_shot_lock = open_sidecar_lock(&one_shot_path)?;
+    one_shot_lock
+        .lock_exclusive()
+        .map_err(|error| format!("cannot lock telemetry one-shot state: {error}"))?;
+    remove_state_file(&path, "aggregate")?;
+    remove_state_file(&one_shot_path, "one-shot")?;
     operation()
+}
+
+pub fn rotate_identity_state_then<T>(
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let path = state_path()?;
+    let one_shot_path = one_shot_path()?;
+    ensure_parent(&path)?;
+    let lock = open_state_lock(&path)?;
+    lock.lock_exclusive()
+        .map_err(|error| format!("cannot lock telemetry aggregate state: {error}"))?;
+    let one_shot_lock = open_sidecar_lock(&one_shot_path)?;
+    one_shot_lock
+        .lock_exclusive()
+        .map_err(|error| format!("cannot lock telemetry one-shot state: {error}"))?;
+    let mut one_shots = load_one_shots_at(&one_shot_path)?;
+    let value = operation()?;
+    one_shots.queued.setup_completed |= one_shots.setup_recorded;
+    one_shots.queued.integrations_detected = one_shots
+        .configured_integrations
+        .len()
+        .try_into()
+        .unwrap_or(MAX_COUNT)
+        .min(MAX_COUNT);
+    remove_state_file(&path, "aggregate")?;
+    write_one_shots(&one_shot_path, &one_shots)?;
+    Ok(value)
+}
+
+fn remove_state_file(path: &std::path::Path, kind: &str) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot purge telemetry {kind} state: {error}")),
+    }
 }
 
 fn load_state() -> Result<AggregateState, String> {
@@ -334,6 +571,70 @@ fn load_state_at(path: &std::path::Path) -> Result<AggregateState, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AggregateState::default()),
         Err(error) => Err(format!("cannot read telemetry aggregate state: {error}")),
     }
+}
+
+fn load_one_shots() -> Result<OneShotState, String> {
+    let path = one_shot_path()?;
+    ensure_parent(&path)?;
+    let lock = open_sidecar_lock(&path)?;
+    lock.lock_exclusive()
+        .map_err(|error| format!("cannot lock telemetry one-shot state: {error}"))?;
+    load_one_shots_at(&path)
+}
+
+fn load_one_shots_at(path: &std::path::Path) -> Result<OneShotState, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| format!("invalid telemetry one-shot state: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(OneShotState::default()),
+        Err(error) => Err(format!("cannot read telemetry one-shot state: {error}")),
+    }
+}
+
+fn with_locked_one_shots<T>(
+    operation: impl FnOnce(OneShotState) -> Result<(OneShotState, T), String>,
+) -> Result<T, String> {
+    let path = one_shot_path()?;
+    ensure_parent(&path)?;
+    let lock = open_sidecar_lock(&path)?;
+    lock.lock_exclusive()
+        .map_err(|error| format!("cannot lock telemetry one-shot state: {error}"))?;
+    let (state, value) = operation(load_one_shots_at(&path)?)?;
+    write_one_shots(&path, &state)?;
+    Ok(value)
+}
+
+fn acknowledge_one_shots_at(
+    path: &std::path::Path,
+    included: &QueuedOneShots,
+) -> Result<(), String> {
+    ensure_parent(path)?;
+    let lock = open_sidecar_lock(path)?;
+    lock.lock_exclusive()
+        .map_err(|error| format!("cannot lock telemetry one-shot state: {error}"))?;
+    let mut state = load_one_shots_at(path)?;
+    if included.setup_completed {
+        state.queued.setup_completed = false;
+    }
+    state.queued.integrations_detected = state
+        .queued
+        .integrations_detected
+        .saturating_sub(included.integrations_detected);
+    if let Some(sent) = included.version_upgrade {
+        state.queued.version_upgrade = match state.queued.version_upgrade {
+            Some(current) if current == sent => None,
+            Some(current)
+                if current.from_major == sent.from_major && current.to_major > sent.to_major =>
+            {
+                Some(VersionTransition {
+                    from_major: sent.to_major,
+                    to_major: current.to_major,
+                })
+            }
+            current => current,
+        };
+    }
+    write_one_shots(path, &state)
 }
 
 #[cfg(test)]
@@ -372,6 +673,20 @@ fn write_state(path: &std::path::Path, state: &AggregateState) -> Result<(), Str
         .map_err(|error| format!("cannot persist telemetry aggregate state: {error}"))
 }
 
+fn write_one_shots(path: &std::path::Path, state: &OneShotState) -> Result<(), String> {
+    let bytes = serde_json::to_vec(state)
+        .map_err(|error| format!("cannot serialize telemetry one-shot state: {error}"))?;
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::PermissionsExt;
+        Some(std::fs::Permissions::from_mode(0o600))
+    };
+    #[cfg(not(unix))]
+    let permissions: Option<std::fs::Permissions> = None;
+    crate::core::atomic_fs::try_atomic_write(path, &bytes, permissions.as_ref())
+        .map_err(|error| format!("cannot persist telemetry one-shot state: {error}"))
+}
+
 fn open_state_lock(path: &std::path::Path) -> Result<std::fs::File, String> {
     std::fs::OpenOptions::new()
         .create(true)
@@ -380,6 +695,10 @@ fn open_state_lock(path: &std::path::Path) -> Result<std::fs::File, String> {
         .write(true)
         .open(path.with_extension("lock"))
         .map_err(|error| format!("cannot open telemetry state lock: {error}"))
+}
+
+fn open_sidecar_lock(path: &std::path::Path) -> Result<std::fs::File, String> {
+    open_state_lock(path)
 }
 
 pub fn build_daily_heartbeat(
@@ -442,6 +761,25 @@ fn client_family() -> ClientFamily {
 mod tests {
     use super::*;
 
+    struct TelemetryEnvGuard(Option<std::ffi::OsString>);
+
+    impl TelemetryEnvGuard {
+        fn disable() -> Self {
+            let previous = std::env::var_os("LEAN_CTX_TELEMETRY");
+            crate::test_env::set_var("LEAN_CTX_TELEMETRY", "off");
+            Self(previous)
+        }
+    }
+
+    impl Drop for TelemetryEnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => crate::test_env::set_var("LEAN_CTX_TELEMETRY", value),
+                None => crate::test_env::remove_var("LEAN_CTX_TELEMETRY"),
+            }
+        }
+    }
+
     fn tool_counts(batch: &TelemetryBatchV2) -> (u64, u64) {
         batch
             .events
@@ -453,6 +791,35 @@ mod tests {
                 _ => None,
             })
             .expect("tool aggregate")
+    }
+
+    fn occurrence_count(batch: &TelemetryBatchV2, name: &str) -> Option<u64> {
+        batch
+            .events
+            .iter()
+            .find_map(|envelope| match &envelope.event {
+                TelemetryEventV2::SetupCompleted(metrics) if name == "setup_completed" => {
+                    Some(metrics.count)
+                }
+                TelemetryEventV2::IntegrationDetected(metrics)
+                    if name == "integration_detected" =>
+                {
+                    Some(metrics.count)
+                }
+                _ => None,
+            })
+    }
+
+    fn version_transition(batch: &TelemetryBatchV2) -> Option<(u16, u16)> {
+        batch
+            .events
+            .iter()
+            .find_map(|envelope| match &envelope.event {
+                TelemetryEventV2::VersionUpgrade(metrics) => {
+                    Some((metrics.from_major, metrics.to_major))
+                }
+                _ => None,
+            })
     }
 
     #[test]
@@ -562,5 +929,134 @@ mod tests {
             .expect("purge completed")
             .expect("purge succeeded");
         worker.join().expect("purge worker");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn one_shots_are_deduplicated_and_ack_only_included_watermarks() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        record_current_version_value("3.9.20").expect("seed major");
+        assert_eq!(
+            version_transition(&preview_daily_batch().expect("preview")),
+            None
+        );
+
+        record_setup_completion(vec!["Claude Code".into(), "Claude Code".into()])
+            .expect("record setup");
+        let first = prepare_daily_batch().expect("prepare first");
+        assert_eq!(occurrence_count(&first, "setup_completed"), Some(1));
+        assert_eq!(occurrence_count(&first, "integration_detected"), Some(1));
+
+        record_setup_completion(vec!["Claude Code".into(), "Codex".into()])
+            .expect("record later integration");
+        record_current_version_value("4.0.0").expect("record upgrade");
+        assert_eq!(prepare_daily_batch().expect("retry exact"), first);
+        acknowledge_daily_batch(&first).expect("ack first");
+
+        let second = prepare_daily_batch().expect("prepare second");
+        assert_eq!(occurrence_count(&second, "setup_completed"), None);
+        assert_eq!(occurrence_count(&second, "integration_detected"), Some(1));
+        assert_eq!(version_transition(&second), Some((3, 4)));
+        record_current_version_value("5.0.0").expect("record next upgrade while pending");
+        acknowledge_daily_batch(&second).expect("ack second");
+
+        let third = prepare_daily_batch().expect("prepare residual upgrade");
+        assert_eq!(version_transition(&third), Some((4, 5)));
+        acknowledge_daily_batch(&third).expect("ack residual upgrade");
+
+        record_current_version_value("2.0.0").expect("ignore downgrade");
+        let final_preview = preview_daily_batch().expect("final preview");
+        assert_eq!(occurrence_count(&final_preview, "setup_completed"), None);
+        assert_eq!(
+            occurrence_count(&final_preview, "integration_detected"),
+            None
+        );
+        assert_eq!(version_transition(&final_preview), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn setup_recording_does_not_wait_for_network_send_lease() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        let lease = begin_daily_send().expect("begin send");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(record_setup_completion(vec!["codex".into()]))
+                .expect("report setup recording");
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("setup recording must not wait for network lease")
+            .expect("setup recording succeeded");
+        drop(lease);
+        worker.join().expect("setup worker");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn setup_recording_respects_environment_opt_out() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        let _telemetry = TelemetryEnvGuard::disable();
+        record_setup_completion(vec!["codex".into()]).expect("opted-out recording is a no-op");
+        assert!(!one_shot_path().expect("one-shot path").exists());
+        let preview = preview_daily_batch().expect("preview");
+        assert_eq!(occurrence_count(&preview, "setup_completed"), None);
+        assert_eq!(occurrence_count(&preview, "integration_detected"), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn identity_rotation_requeues_installation_scoped_facts() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        record_setup_completion(vec!["codex".into(), "claude".into()]).expect("record setup");
+        let first = prepare_daily_batch().expect("prepare first");
+        acknowledge_daily_batch(&first).expect("ack first");
+
+        rotate_identity_state_then(|| Ok(())).expect("rotate state");
+        let replay = preview_daily_batch().expect("preview replay");
+        assert_eq!(occurrence_count(&replay, "setup_completed"), Some(1));
+        assert_eq!(occurrence_count(&replay, "integration_detected"), Some(2));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn failed_identity_rotation_does_not_requeue_old_identity_facts() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        record_setup_completion(vec!["codex".into()]).expect("record setup");
+        let first = prepare_daily_batch().expect("prepare first");
+        acknowledge_daily_batch(&first).expect("ack first");
+
+        assert!(rotate_identity_state_then::<()>(|| Err("reset failed".into())).is_err());
+        let unchanged = preview_daily_batch().expect("preview unchanged state");
+        assert_eq!(occurrence_count(&unchanged, "setup_completed"), None);
+        assert_eq!(occurrence_count(&unchanged, "integration_detected"), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn legacy_pending_batch_is_discarded_after_identity_change() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        let stale = prepare_daily_batch().expect("prepare old identity batch");
+        let stale_id = batch_installation_id(&stale).to_string();
+        let path = state_path().expect("state path");
+        let legacy_state = load_state_at(&path).expect("load state");
+        let mut legacy_json = serde_json::to_value(legacy_state).expect("serialize legacy state");
+        legacy_json
+            .as_object_mut()
+            .expect("aggregate state object")
+            .remove("installation_id");
+        let bytes = serde_json::to_vec(&legacy_json).expect("encode legacy JSON");
+        crate::core::atomic_fs::try_atomic_write(&path, &bytes, None)
+            .expect("write legacy state without identity field");
+
+        let current_id = installation_id::reset().expect("rotate identity directly");
+        assert_ne!(current_id, stale_id);
+        let current = preview_daily_batch().expect("preview current identity");
+        assert_ne!(current, stale);
+        assert!(
+            current
+                .events
+                .iter()
+                .all(|event| event.installation_id == current_id)
+        );
     }
 }

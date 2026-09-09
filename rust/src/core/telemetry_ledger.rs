@@ -89,6 +89,19 @@ pub(crate) fn read_all() -> Vec<HeartbeatRecord> {
     read_paths(&path)
 }
 
+pub(crate) fn latest_valid_version() -> Option<String> {
+    let path = ledger_path().ok()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let lock = open_lock(&path).ok()?;
+    lock.lock_exclusive().ok()?;
+    read_paths(&path)
+        .into_iter()
+        .rev()
+        .find_map(|record| (!record.version.is_empty()).then_some(record.version))
+}
+
 pub(crate) fn purge_local() -> Result<(), String> {
     let path = ledger_path()?;
     if let Some(parent) = path.parent() {

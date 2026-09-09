@@ -143,7 +143,7 @@ fn reset_id() {
             std::process::exit(1);
         }
     }
-    match crate::core::telemetry_aggregate::purge_local_state_then(installation_id::reset) {
+    match crate::core::telemetry_aggregate::rotate_identity_state_then(installation_id::reset) {
         Ok(new_id) => {
             println!(
                 "Installation ID regenerated: {}",
@@ -254,7 +254,9 @@ fn delete_remote() {
     };
     match crate::cloud_client::delete_remote_telemetry(&installation_id, &deletion_token) {
         Ok(true) => {
-            match crate::core::telemetry_aggregate::purge_local_state_then(installation_id::reset) {
+            match crate::core::telemetry_aggregate::rotate_identity_state_then(
+                installation_id::reset,
+            ) {
                 Ok(_) => {
                     println!("Remote telemetry was deleted and the local identity was rotated.");
                 }

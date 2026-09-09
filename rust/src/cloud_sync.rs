@@ -106,11 +106,15 @@ pub fn cloud_background_tasks() {
     // Unified anonymous telemetry: heartbeat + contribute entries in one request.
     let do_not_track = std::env::var("DO_NOT_TRACK").ok();
     let telemetry_override = std::env::var("LEAN_CTX_TELEMETRY").ok();
-    if config
+    let telemetry_eligible = config
         .telemetry
-        .send_eligible(do_not_track.as_deref(), telemetry_override.as_deref())
-        && !already_heartbeated
+        .send_eligible(do_not_track.as_deref(), telemetry_override.as_deref());
+    if telemetry_eligible
+        && let Err(error) = crate::core::telemetry_aggregate::record_current_version()
     {
+        tracing::debug!("telemetry version aggregate unavailable: {error}");
+    }
+    if telemetry_eligible && !already_heartbeated {
         if let Ok(lease) = crate::core::telemetry_aggregate::begin_daily_send() {
             let batch = lease.batch().clone();
             let installation_id = batch

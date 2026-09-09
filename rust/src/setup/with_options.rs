@@ -65,6 +65,25 @@ pub fn run_setup_with_options(opts: SetupOptions) -> Result<SetupReport, String>
 
     let report = build_setup_report(started_at, steps);
     persist_setup_report(&report)?;
+    if report.success {
+        let successful_names = report
+            .steps
+            .iter()
+            .filter(|step| step.name == "editors")
+            .flat_map(|step| &step.items)
+            .filter(|item| matches!(item.status.as_str(), "created" | "updated" | "already"))
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>();
+        let integrations = targets
+            .iter()
+            .filter(|target| successful_names.contains(&target.name))
+            .map(|target| target.agent_key.clone())
+            .collect::<Vec<_>>();
+        if let Err(error) = crate::core::telemetry_aggregate::record_setup_completion(integrations)
+        {
+            tracing::debug!("telemetry setup aggregate unavailable: {error}");
+        }
+    }
 
     Ok(report)
 }

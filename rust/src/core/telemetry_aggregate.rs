@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use super::installation_id;
 use super::telemetry_v2::{
-    Architecture, ClientFamily, DistributionChannel, HeartbeatMetrics, Histogram, MAX_COUNT,
-    OccurrenceMetrics, OperatingSystem, SCHEMA_VERSION, SessionMetrics, SyncMetrics,
+    Architecture, ClientFamily, DecisionMetrics, DistributionChannel, HeartbeatMetrics, Histogram,
+    MAX_COUNT, OccurrenceMetrics, OperatingSystem, SCHEMA_VERSION, SessionMetrics, SyncMetrics,
     TelemetryBatchV2, TelemetryEnvelopeV2, TelemetryEventV2, ToolUsageMetrics,
     VersionUpgradeMetrics,
 };
@@ -58,6 +58,10 @@ struct QueuedOneShots {
     version_upgrade: Option<VersionTransition>,
     #[serde(default)]
     sync: SyncMetrics,
+    #[serde(default)]
+    autopilot: DecisionMetrics,
+    #[serde(default)]
+    autopilot_fallback: DecisionMetrics,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -374,6 +378,19 @@ fn build_daily_aggregate(
             TelemetryEventV2::SyncAggregate(queued.sync.clone()),
         ));
     }
+    if queued.autopilot.admitted > 0 || queued.autopilot.denied > 0 || queued.autopilot.fallback > 0
+    {
+        batch.events.push(envelope_like(
+            &common,
+            TelemetryEventV2::AutopilotAggregate(queued.autopilot.clone()),
+        ));
+    }
+    if queued.autopilot_fallback.fallback > 0 {
+        batch.events.push(envelope_like(
+            &common,
+            TelemetryEventV2::AutopilotFallbackAggregate(queued.autopilot_fallback.clone()),
+        ));
+    }
     batch
         .validate()
         .map_err(|error| format!("invalid telemetry batch: {error:?}"))?;
@@ -499,6 +516,48 @@ pub fn record_sync_result(success: bool) -> Result<(), String> {
     })
 }
 
+pub fn record_autopilot_decisions(admitted: u64, denied: u64) -> Result<(), String> {
+    if !telemetry_collection_eligible() {
+        return Ok(());
+    }
+    with_locked_one_shots(|mut state| {
+        state.queued.autopilot.admitted = state
+            .queued
+            .autopilot
+            .admitted
+            .saturating_add(admitted)
+            .min(MAX_COUNT);
+        state.queued.autopilot.denied = state
+            .queued
+            .autopilot
+            .denied
+            .saturating_add(denied)
+            .min(MAX_COUNT);
+        Ok((state, ()))
+    })
+}
+
+pub fn record_autopilot_fallback() -> Result<(), String> {
+    if !telemetry_collection_eligible() {
+        return Ok(());
+    }
+    with_locked_one_shots(|mut state| {
+        state.queued.autopilot.fallback = state
+            .queued
+            .autopilot
+            .fallback
+            .saturating_add(1)
+            .min(MAX_COUNT);
+        state.queued.autopilot_fallback.fallback = state
+            .queued
+            .autopilot_fallback
+            .fallback
+            .saturating_add(1)
+            .min(MAX_COUNT);
+        Ok((state, ()))
+    })
+}
+
 fn telemetry_collection_eligible() -> bool {
     let config = crate::core::config::Config::load_global();
     let do_not_track = std::env::var("DO_NOT_TRACK").ok();
@@ -595,6 +654,8 @@ pub fn rotate_identity_state_then<T>(
         .unwrap_or(MAX_COUNT)
         .min(MAX_COUNT);
     one_shots.queued.sync = SyncMetrics::default();
+    one_shots.queued.autopilot = DecisionMetrics::default();
+    one_shots.queued.autopilot_fallback = DecisionMetrics::default();
     remove_state_file(&path, "aggregate")?;
     write_one_shots(&one_shot_path, &one_shots)?;
     Ok(value)
@@ -655,6 +716,8 @@ fn one_shots_for_current_identity(mut state: OneShotState) -> Result<OneShotStat
             .unwrap_or(MAX_COUNT)
             .min(MAX_COUNT);
         state.queued.sync = SyncMetrics::default();
+        state.queued.autopilot = DecisionMetrics::default();
+        state.queued.autopilot_fallback = DecisionMetrics::default();
     }
     Ok(state)
 }
@@ -704,6 +767,11 @@ fn acknowledge_one_shots_at(
         .sync
         .failures
         .saturating_sub(included.sync.failures);
+    subtract_decisions(&mut state.queued.autopilot, &included.autopilot);
+    subtract_decisions(
+        &mut state.queued.autopilot_fallback,
+        &included.autopilot_fallback,
+    );
     if let Some(sent) = included.version_upgrade {
         state.queued.version_upgrade = match state.queued.version_upgrade {
             Some(current) if current == sent => None,
@@ -719,6 +787,12 @@ fn acknowledge_one_shots_at(
         };
     }
     write_one_shots(path, &state)
+}
+
+fn subtract_decisions(current: &mut DecisionMetrics, included: &DecisionMetrics) {
+    current.admitted = current.admitted.saturating_sub(included.admitted);
+    current.denied = current.denied.saturating_sub(included.denied);
+    current.fallback = current.fallback.saturating_sub(included.fallback);
 }
 
 #[cfg(test)]
@@ -918,6 +992,30 @@ mod tests {
             })
     }
 
+    fn autopilot_counts(batch: &TelemetryBatchV2) -> Option<(u64, u64, u64)> {
+        batch
+            .events
+            .iter()
+            .find_map(|envelope| match &envelope.event {
+                TelemetryEventV2::AutopilotAggregate(metrics) => {
+                    Some((metrics.admitted, metrics.denied, metrics.fallback))
+                }
+                _ => None,
+            })
+    }
+
+    fn autopilot_fallback_counts(batch: &TelemetryBatchV2) -> Option<(u64, u64, u64)> {
+        batch
+            .events
+            .iter()
+            .find_map(|envelope| match &envelope.event {
+                TelemetryEventV2::AutopilotFallbackAggregate(metrics) => {
+                    Some((metrics.admitted, metrics.denied, metrics.fallback))
+                }
+                _ => None,
+            })
+    }
+
     #[test]
     fn daily_batch_is_typed_bounded_and_contains_no_runtime_content() {
         let batch = build_daily_heartbeat(
@@ -1094,11 +1192,58 @@ mod tests {
         let _telemetry = TelemetryEnvGuard::disable();
         record_setup_completion(vec!["codex".into()]).expect("opted-out recording is a no-op");
         record_sync_result(true).expect("opted-out sync recording is a no-op");
+        record_autopilot_decisions(1, 1).expect("opted-out decision recording is a no-op");
+        record_autopilot_fallback().expect("opted-out fallback recording is a no-op");
         assert!(!one_shot_path().expect("one-shot path").exists());
         let preview = preview_daily_batch().expect("preview");
         assert_eq!(occurrence_count(&preview, "setup_completed"), None);
         assert_eq!(occurrence_count(&preview, "integration_detected"), None);
         assert_eq!(sync_counts(&preview), None);
+        assert_eq!(autopilot_counts(&preview), None);
+        assert_eq!(autopilot_fallback_counts(&preview), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn autopilot_results_are_durable_and_ack_only_the_pending_snapshot() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        record_autopilot_decisions(2, 1).expect("record decisions");
+        let first = prepare_daily_batch().expect("prepare first");
+        assert_eq!(autopilot_counts(&first), Some((2, 1, 0)));
+
+        record_autopilot_decisions(1, 2).expect("record concurrent decisions");
+        record_autopilot_fallback().expect("record concurrent fallback");
+        assert_eq!(prepare_daily_batch().expect("retry"), first);
+        acknowledge_daily_batch(&first).expect("ack first");
+
+        let residual = preview_daily_batch().expect("residual preview");
+        assert_eq!(autopilot_counts(&residual), Some((1, 2, 1)));
+        assert_eq!(autopilot_fallback_counts(&residual), Some((0, 0, 1)));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn saturated_autopilot_counters_remain_bounded() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        with_locked_one_shots(|mut state| {
+            state.queued.autopilot = DecisionMetrics {
+                admitted: MAX_COUNT,
+                denied: MAX_COUNT,
+                fallback: MAX_COUNT,
+            };
+            state.queued.autopilot_fallback.fallback = MAX_COUNT;
+            Ok((state, ()))
+        })
+        .expect("seed saturated autopilot counts");
+
+        record_autopilot_decisions(1, 1).expect("saturated decision recorder is a no-op");
+        record_autopilot_fallback().expect("saturated fallback recorder is a no-op");
+        let preview = preview_daily_batch().expect("preview");
+        assert_eq!(
+            autopilot_counts(&preview),
+            Some((MAX_COUNT, MAX_COUNT, MAX_COUNT))
+        );
+        assert_eq!(autopilot_fallback_counts(&preview), Some((0, 0, MAX_COUNT)));
     }
 
     #[test]
@@ -1148,12 +1293,16 @@ mod tests {
         let first = prepare_daily_batch().expect("prepare first");
         acknowledge_daily_batch(&first).expect("ack first");
         record_sync_result(true).expect("record old-identity sync");
+        record_autopilot_decisions(1, 1).expect("record old-identity decisions");
+        record_autopilot_fallback().expect("record old-identity fallback");
 
         rotate_identity_state_then(|| Ok(())).expect("rotate state");
         let replay = preview_daily_batch().expect("preview replay");
         assert_eq!(occurrence_count(&replay, "setup_completed"), Some(1));
         assert_eq!(occurrence_count(&replay, "integration_detected"), Some(2));
         assert_eq!(sync_counts(&replay), None);
+        assert_eq!(autopilot_counts(&replay), None);
+        assert_eq!(autopilot_fallback_counts(&replay), None);
     }
 
     #[test]
@@ -1207,11 +1356,15 @@ mod tests {
         let first = prepare_daily_batch().expect("prepare first");
         acknowledge_daily_batch(&first).expect("ack setup");
         record_sync_result(true).expect("record old-identity sync");
+        record_autopilot_decisions(1, 1).expect("record old-identity decisions");
+        record_autopilot_fallback().expect("record old-identity fallback");
 
         installation_id::reset().expect("simulate successful reset before sidecar cleanup");
         let current = preview_daily_batch().expect("preview rebound sidecar");
         assert_eq!(occurrence_count(&current, "setup_completed"), Some(1));
         assert_eq!(occurrence_count(&current, "integration_detected"), Some(1));
         assert_eq!(sync_counts(&current), None);
+        assert_eq!(autopilot_counts(&current), None);
+        assert_eq!(autopilot_fallback_counts(&current), None);
     }
 }

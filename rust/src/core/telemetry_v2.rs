@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Privacy-bounded, versioned telemetry event contract.
 
 use chrono::NaiveDate;

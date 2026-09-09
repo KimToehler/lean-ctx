@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Privacy-safe daily telemetry aggregation.
 
 use sha2::Digest;

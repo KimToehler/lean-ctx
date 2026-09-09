@@ -963,10 +963,23 @@ pub fn start_checkout(plan: &str, interval: &str) -> Result<String, String> {
     let json: serde_json::Value =
         serde_json::from_str(&resp_body).map_err(|e| format!("Invalid response: {e}"))?;
 
-    json["url"]
+    parse_checkout_url(&json)
+}
+
+fn parse_checkout_url(json: &serde_json::Value) -> Result<String, String> {
+    let raw = json["url"]
         .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| "Billing did not return a checkout URL.".to_string())
+        .ok_or_else(|| "Billing did not return a checkout URL.".to_string())?;
+    let parsed = reqwest::Url::parse(raw)
+        .map_err(|_| "Billing returned an invalid checkout URL.".to_string())?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err("Billing returned an invalid checkout URL.".to_string());
+    }
+    Ok(raw.to_string())
 }
 
 pub fn push_commands(entries: &[serde_json::Value]) -> Result<String, String> {
@@ -1314,6 +1327,30 @@ mod tests {
         assert!(!deletion_confirmed(204, "").unwrap());
         assert!(!deletion_confirmed(200, r#"{"deleted":false}"#).unwrap());
         assert!(deletion_confirmed(200, "not-json").is_err());
+    }
+
+    #[test]
+    fn checkout_response_requires_credential_free_absolute_https_url() {
+        assert_eq!(
+            parse_checkout_url(&serde_json::json!({
+                "url": "https://checkout.stripe.com/c/pay/test_session?prefilled_email=x"
+            }))
+            .unwrap(),
+            "https://checkout.stripe.com/c/pay/test_session?prefilled_email=x"
+        );
+        for response in [
+            serde_json::json!({}),
+            serde_json::json!({ "url": null }),
+            serde_json::json!({ "url": "" }),
+            serde_json::json!({ "url": "/checkout/session" }),
+            serde_json::json!({ "url": "http://checkout.stripe.com/session" }),
+            serde_json::json!({ "url": "https://user:secret@example.com/session" }),
+        ] {
+            assert!(
+                parse_checkout_url(&response).is_err(),
+                "accepted {response}"
+            );
+        }
     }
 
     #[test]

@@ -908,6 +908,9 @@ fn cloud_upgrade(args: &[String]) {
     println!("Starting {plan} checkout ({interval})...");
     match cloud_client::start_checkout(&plan, &interval) {
         Ok(url) => {
+            if let Err(error) = crate::core::telemetry_aggregate::record_checkout_started() {
+                tracing::debug!("telemetry checkout aggregate unavailable: {error}");
+            }
             println!();
             println!("Open this link to complete your subscription:");
             println!("  {url}");

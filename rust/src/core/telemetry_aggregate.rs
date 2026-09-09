@@ -12,10 +12,10 @@ use serde::{Deserialize, Serialize};
 
 use super::installation_id;
 use super::telemetry_v2::{
-    Architecture, ClientFamily, DecisionMetrics, DistributionChannel, HeartbeatMetrics, Histogram,
-    MAX_COUNT, OccurrenceMetrics, OperatingSystem, SCHEMA_VERSION, SessionMetrics, SyncMetrics,
-    TelemetryBatchV2, TelemetryEnvelopeV2, TelemetryEventV2, ToolUsageMetrics,
-    VersionUpgradeMetrics,
+    Architecture, ClientFamily, DecisionMetrics, DistributionChannel, ErrorCategory, ErrorMetrics,
+    HeartbeatMetrics, Histogram, MAX_COUNT, OccurrenceMetrics, OperatingSystem, SCHEMA_VERSION,
+    SessionMetrics, SyncMetrics, TelemetryBatchV2, TelemetryEnvelopeV2, TelemetryEventV2,
+    ToolUsageMetrics, VersionUpgradeMetrics,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -66,6 +66,8 @@ struct QueuedOneShots {
     autopilot_fallback: DecisionMetrics,
     #[serde(default)]
     checkout_started: u64,
+    #[serde(default)]
+    error_categories: [u64; 8],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -418,6 +420,15 @@ fn build_daily_aggregate(
             }),
         ));
     }
+    for (index, category) in ERROR_CATEGORIES.into_iter().enumerate() {
+        let count = queued.error_categories[index].min(MAX_COUNT);
+        if count > 0 {
+            batch.events.push(envelope_like(
+                &common,
+                TelemetryEventV2::ErrorCategoryAggregate(ErrorMetrics { category, count }),
+            ));
+        }
+    }
     batch
         .validate()
         .map_err(|error| format!("invalid telemetry batch: {error:?}"))?;
@@ -599,6 +610,37 @@ pub fn record_checkout_started() -> Result<(), String> {
     })
 }
 
+const ERROR_CATEGORIES: [ErrorCategory; 8] = [
+    ErrorCategory::Authentication,
+    ErrorCategory::Authorization,
+    ErrorCategory::Configuration,
+    ErrorCategory::Network,
+    ErrorCategory::Provider,
+    ErrorCategory::Timeout,
+    ErrorCategory::Validation,
+    ErrorCategory::Internal,
+];
+
+pub fn record_error_category(category: ErrorCategory) -> Result<(), String> {
+    record_error_category_inner(category)
+}
+
+fn record_error_category_inner(category: ErrorCategory) -> Result<(), String> {
+    if !telemetry_collection_eligible() {
+        return Ok(());
+    }
+    let index = ERROR_CATEGORIES
+        .iter()
+        .position(|candidate| *candidate == category)
+        .expect("closed error category");
+    with_locked_one_shots(|mut state| {
+        state.queued.error_categories[index] = state.queued.error_categories[index]
+            .saturating_add(1)
+            .min(MAX_COUNT);
+        Ok((state, ()))
+    })
+}
+
 fn telemetry_collection_eligible() -> bool {
     let config = crate::core::config::Config::load_global();
     let do_not_track = std::env::var("DO_NOT_TRACK").ok();
@@ -698,6 +740,7 @@ pub fn rotate_identity_state_then<T>(
     one_shots.queued.autopilot = DecisionMetrics::default();
     one_shots.queued.autopilot_fallback = DecisionMetrics::default();
     one_shots.queued.checkout_started = 0;
+    one_shots.queued.error_categories = [0; 8];
     one_shots.last_acknowledged_batch = None;
     remove_state_file(&path, "aggregate")?;
     write_one_shots(&one_shot_path, &one_shots)?;
@@ -762,6 +805,7 @@ fn one_shots_for_current_identity(mut state: OneShotState) -> Result<OneShotStat
         state.queued.autopilot = DecisionMetrics::default();
         state.queued.autopilot_fallback = DecisionMetrics::default();
         state.queued.checkout_started = 0;
+        state.queued.error_categories = [0; 8];
         state.last_acknowledged_batch = None;
     }
     Ok(state)
@@ -825,6 +869,14 @@ fn acknowledge_one_shots_at(
         .queued
         .checkout_started
         .saturating_sub(included.checkout_started);
+    for (queued, included) in state
+        .queued
+        .error_categories
+        .iter_mut()
+        .zip(included.error_categories)
+    {
+        *queued = queued.saturating_sub(included);
+    }
     if let Some(sent) = included.version_upgrade {
         state.queued.version_upgrade = match state.queued.version_upgrade {
             Some(current) if current == sent => None,
@@ -1073,6 +1125,20 @@ mod tests {
             })
     }
 
+    fn error_count(batch: &TelemetryBatchV2, category: ErrorCategory) -> Option<u64> {
+        batch
+            .events
+            .iter()
+            .find_map(|envelope| match &envelope.event {
+                TelemetryEventV2::ErrorCategoryAggregate(metrics)
+                    if metrics.category == category =>
+                {
+                    Some(metrics.count)
+                }
+                _ => None,
+            })
+    }
+
     #[test]
     fn daily_batch_is_typed_bounded_and_contains_no_runtime_content() {
         let batch = build_daily_heartbeat(
@@ -1252,6 +1318,8 @@ mod tests {
         record_autopilot_decisions(1, 1).expect("opted-out decision recording is a no-op");
         record_autopilot_fallback().expect("opted-out fallback recording is a no-op");
         record_checkout_started().expect("opted-out checkout recording is a no-op");
+        record_error_category(ErrorCategory::Internal)
+            .expect("opted-out error recording is a no-op");
         assert!(!one_shot_path().expect("one-shot path").exists());
         let preview = preview_daily_batch().expect("preview");
         assert_eq!(occurrence_count(&preview, "setup_completed"), None);
@@ -1260,6 +1328,54 @@ mod tests {
         assert_eq!(autopilot_counts(&preview), None);
         assert_eq!(autopilot_fallback_counts(&preview), None);
         assert_eq!(occurrence_count(&preview, "checkout_started"), None);
+        assert_eq!(error_count(&preview, ErrorCategory::Internal), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn error_categories_are_typed_durable_and_ack_only_the_pending_snapshot() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        for category in ERROR_CATEGORIES {
+            record_error_category(category).expect("record error category");
+        }
+        let first = prepare_daily_batch().expect("prepare first");
+        for category in ERROR_CATEGORIES {
+            assert_eq!(error_count(&first, category), Some(1));
+        }
+
+        record_error_category(ErrorCategory::Timeout).expect("record concurrent timeout");
+        assert_eq!(prepare_daily_batch().expect("retry"), first);
+        acknowledge_daily_batch(&first).expect("ack first");
+
+        let residual = preview_daily_batch().expect("residual preview");
+        assert_eq!(error_count(&residual, ErrorCategory::Timeout), Some(1));
+        for category in ERROR_CATEGORIES {
+            if category != ErrorCategory::Timeout {
+                assert_eq!(error_count(&residual, category), None);
+            }
+        }
+        let json = serde_json::to_string(&residual).expect("serialize telemetry");
+        assert!(!json.contains("error message"));
+        assert!(!json.contains("stack"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn error_category_counter_saturates_at_schema_bound() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        with_locked_one_shots(|mut state| {
+            state.queued.error_categories[7] = MAX_COUNT;
+            Ok((state, ()))
+        })
+        .expect("seed saturated counter");
+        record_error_category(ErrorCategory::Internal).expect("saturated recorder is a no-op");
+        assert_eq!(
+            error_count(
+                &preview_daily_batch().expect("preview"),
+                ErrorCategory::Internal
+            ),
+            Some(MAX_COUNT)
+        );
     }
 
     #[test]
@@ -1436,6 +1552,7 @@ mod tests {
         record_autopilot_decisions(1, 1).expect("record old-identity decisions");
         record_autopilot_fallback().expect("record old-identity fallback");
         record_checkout_started().expect("record old-identity checkout");
+        record_error_category(ErrorCategory::Internal).expect("record old-identity error");
 
         rotate_identity_state_then(|| Ok(())).expect("rotate state");
         let replay = preview_daily_batch().expect("preview replay");
@@ -1445,6 +1562,7 @@ mod tests {
         assert_eq!(autopilot_counts(&replay), None);
         assert_eq!(autopilot_fallback_counts(&replay), None);
         assert_eq!(occurrence_count(&replay, "checkout_started"), None);
+        assert_eq!(error_count(&replay, ErrorCategory::Internal), None);
     }
 
     #[test]
@@ -1501,6 +1619,7 @@ mod tests {
         record_autopilot_decisions(1, 1).expect("record old-identity decisions");
         record_autopilot_fallback().expect("record old-identity fallback");
         record_checkout_started().expect("record old-identity checkout");
+        record_error_category(ErrorCategory::Internal).expect("record old-identity error");
 
         installation_id::reset().expect("simulate successful reset before sidecar cleanup");
         let current = preview_daily_batch().expect("preview rebound sidecar");
@@ -1510,5 +1629,6 @@ mod tests {
         assert_eq!(autopilot_counts(&current), None);
         assert_eq!(autopilot_fallback_counts(&current), None);
         assert_eq!(occurrence_count(&current, "checkout_started"), None);
+        assert_eq!(error_count(&current, ErrorCategory::Internal), None);
     }
 }

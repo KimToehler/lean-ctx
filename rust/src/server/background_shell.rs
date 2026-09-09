@@ -36,6 +36,7 @@ struct Job {
     // background caller (explicit or detached) may still poll it by id.
     foreground_waiters: usize,
     background_owned: bool,
+    telemetry_recorded: bool,
 }
 
 static JOBS: LazyLock<Mutex<HashMap<String, Job>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -161,6 +162,7 @@ fn start_inner(
                 live,
                 foreground_waiters: usize::from(foreground),
                 background_owned: !foreground,
+                telemetry_recorded: false,
             },
         );
     }
@@ -185,12 +187,23 @@ fn start_inner(
         let Some(job) = jobs.get_mut(&worker_id) else {
             return;
         };
-        job.state = if worker_cancel.load(Ordering::Acquire) {
+        let cancelled = worker_cancel.load(Ordering::Acquire);
+        job.state = if cancelled {
             JobState::Cancelled { output }
         } else {
             JobState::Completed { output, exit_code }
         };
         job.finished_at = Some(Instant::now());
+        if !cancelled && exit_code != 0 {
+            let category = if exit_code == 124 {
+                crate::core::telemetry_v2::ErrorCategory::Timeout
+            } else {
+                crate::core::telemetry_v2::ErrorCategory::Internal
+            };
+            if crate::core::telemetry_aggregate::record_error_category(category).is_ok() {
+                job.telemetry_recorded = true;
+            }
+        }
         prune_finished_jobs(&mut jobs, Instant::now());
     });
     id
@@ -321,6 +334,29 @@ pub fn status(id: &str) -> Option<JobState> {
     })
 }
 
+/// Persist one aggregate for a terminal failed job, then mark that concrete
+/// retained job instance. A later execution may reuse the content-addressed ID,
+/// but replaces the `Job` and therefore starts with a fresh marker.
+pub fn record_error_telemetry_once(
+    id: &str,
+    category: crate::core::telemetry_v2::ErrorCategory,
+) -> Result<bool, String> {
+    let mut jobs = JOBS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(job) = jobs.get_mut(id) else {
+        return Ok(false);
+    };
+    if job.telemetry_recorded
+        || !matches!(job.state, JobState::Completed { exit_code, .. } if exit_code != 0)
+    {
+        return Ok(false);
+    }
+    crate::core::telemetry_aggregate::record_error_category(category)?;
+    job.telemetry_recorded = true;
+    Ok(true)
+}
+
 pub fn cancel(id: &str) -> Option<JobState> {
     let mut jobs = JOBS
         .lock()
@@ -338,6 +374,74 @@ mod tests {
         ForegroundResult, JobState, TICK, cancel, run_foreground_or_detach, start, status,
     };
     use std::time::Duration;
+
+    fn completed_job(exit_code: i32) -> super::Job {
+        super::Job {
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            state: JobState::Completed {
+                output: "opaque output".into(),
+                exit_code,
+            },
+            finished_at: Some(std::time::Instant::now()),
+            live: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            foreground_waiters: 0,
+            background_owned: true,
+            telemetry_recorded: false,
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn failed_job_telemetry_is_once_per_execution_even_when_id_is_reused() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        let id = "shell_same_content";
+        super::JOBS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.into(), completed_job(2));
+
+        assert!(
+            super::record_error_telemetry_once(
+                id,
+                crate::core::telemetry_v2::ErrorCategory::Internal
+            )
+            .expect("record first execution")
+        );
+        assert!(
+            !super::record_error_telemetry_once(
+                id,
+                crate::core::telemetry_v2::ErrorCategory::Internal
+            )
+            .expect("deduplicate repeated poll")
+        );
+
+        super::JOBS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.into(), completed_job(2));
+        assert!(
+            super::record_error_telemetry_once(
+                id,
+                crate::core::telemetry_v2::ErrorCategory::Internal
+            )
+            .expect("record replacement execution")
+        );
+
+        let batch = crate::core::telemetry_aggregate::preview_daily_batch().expect("preview");
+        let count = batch
+            .events
+            .iter()
+            .find_map(|envelope| match &envelope.event {
+                crate::core::telemetry_v2::TelemetryEventV2::ErrorCategoryAggregate(metrics)
+                    if metrics.category == crate::core::telemetry_v2::ErrorCategory::Internal =>
+                {
+                    Some(metrics.count)
+                }
+                _ => None,
+            });
+        assert_eq!(count, Some(2));
+        super::remove_for_test(id);
+    }
 
     #[test]
     fn completed_job_retention_is_bounded() {
@@ -359,6 +463,7 @@ mod tests {
                     live: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
                     foreground_waiters: 0,
                     background_owned: true,
+                    telemetry_recorded: false,
                 },
             );
         }
@@ -377,6 +482,7 @@ mod tests {
                 live: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
                 foreground_waiters: 0,
                 background_owned: true,
+                telemetry_recorded: false,
             },
         );
 
@@ -407,6 +513,7 @@ mod tests {
                     live: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
                     foreground_waiters: 0,
                     background_owned: true,
+                    telemetry_recorded: false,
                 },
             );
         }
@@ -773,6 +880,7 @@ mod tests {
                 live: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
                 foreground_waiters: 1,
                 background_owned: false,
+                telemetry_recorded: false,
             },
         );
 

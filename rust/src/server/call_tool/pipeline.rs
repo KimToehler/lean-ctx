@@ -38,6 +38,7 @@ pub(in crate::server) async fn dispatch_and_post_process(
                 // respawn the server. Return a soft tool error so the agent
                 // sees the validation message and can fix parameter names.
                 if e.code == rmcp::model::ErrorCode::INVALID_PARAMS {
+                    super::error_telemetry::record_mcp_error(e.code);
                     tracing::debug!(
                         "converting INVALID_PARAMS to soft tool error for '{name}': {}",
                         e.message
@@ -55,6 +56,7 @@ pub(in crate::server) async fn dispatch_and_post_process(
                     return Ok(result);
                 }
 
+                super::error_telemetry::record_mcp_error(e.code);
                 record_decision_loop_end_error(decision_context.as_ref(), args, shadow_auto_record);
                 return Err(e);
             }
@@ -1142,6 +1144,7 @@ pub(in crate::server) async fn dispatch_and_post_process(
     let compressed_input_tokens = crate::core::tokens::count_tokens(&result_text) as u64;
     let raw_input_tokens = compressed_input_tokens
         .saturating_add(u64::try_from(tool_saved_tokens).unwrap_or(u64::MAX));
+    super::error_telemetry::record_shell_error_category(shell_outcome.as_ref(), &result_text);
     let mut result = finalize_call_result(&result_text, shell_outcome);
     let has_dynamic = had_auto_context || had_budget_warning || had_throttle_warning;
     let mut meta = rmcp::model::Meta::new();

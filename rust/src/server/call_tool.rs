@@ -5,6 +5,7 @@
 #[allow(unused_imports, clippy::wildcard_imports)]
 use super::*;
 
+mod error_telemetry;
 mod guarded;
 mod outcome;
 mod pipeline;

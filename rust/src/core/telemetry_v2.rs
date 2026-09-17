@@ -87,9 +87,19 @@ impl TelemetryEnvelopeV2 {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct PseudonymousId(String);
+
+impl<'de> Deserialize<'de> for PseudonymousId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?)
+            .map_err(|_| serde::de::Error::custom("invalid pseudonymous ID"))
+    }
+}
 
 impl PseudonymousId {
     pub fn new(value: impl Into<String>) -> Result<Self, TelemetryValidationError> {
@@ -112,7 +122,12 @@ impl PseudonymousId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "name", content = "metrics", rename_all = "snake_case")]
+#[serde(
+    tag = "name",
+    content = "metrics",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum TelemetryEventV2 {
     Heartbeat(HeartbeatMetrics),
     SetupCompleted(OccurrenceMetrics),
@@ -549,6 +564,67 @@ mod tests {
     }
 
     #[test]
+    fn event_wrapper_preserves_valid_v2_wire_bytes() {
+        let raw = r#"{"name":"setup_completed","metrics":{"count":1}}"#;
+        let decoded: TelemetryEventV2 = serde_json::from_str(raw).unwrap();
+        assert_eq!(decoded.name(), "setup_completed");
+        decoded.validate().unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), raw);
+        let event = envelope(decoded);
+        let encoded = serde_json::to_vec(&event).unwrap();
+        let decoded: TelemetryEnvelopeV2 = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, event);
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), encoded);
+    }
+
+    #[test]
+    fn event_wrapper_rejects_forbidden_fields_in_every_key_position() {
+        // Synthetic privacy fixtures only; no captured content or credentials.
+        let forbidden = [
+            ("source_code", "fn synthetic_fixture() {}"),
+            ("absolute_path", "/synthetic/private/example.rs"),
+            ("prompt", "synthetic private task instructions"),
+            ("secret", "SYNTHETIC_NOT_A_CREDENTIAL"),
+            (
+                "repository_url",
+                "https://example.invalid/private/project.git",
+            ),
+        ];
+        for base in [
+            r#"{"name":"setup_completed","metrics":{"count":1}}"#,
+            r#"{"metrics":{"count":1},"name":"setup_completed"}"#,
+        ] {
+            let valid: TelemetryEventV2 = serde_json::from_str(base).unwrap();
+            valid.validate().unwrap();
+            for (field, value) in forbidden {
+                let property = format!(
+                    "{}:{}",
+                    serde_json::to_string(field).unwrap(),
+                    serde_json::to_string(value).unwrap()
+                );
+                let middle = base.find(',').unwrap();
+                for injected in [
+                    format!("{{{property},{}", &base[1..]),
+                    format!("{},{property}{}", &base[..middle], &base[middle..]),
+                    format!("{},{property}}}", &base[..base.len() - 1]),
+                ] {
+                    // Establish valid JSON independently: parse errors must be
+                    // caused by the forbidden event field, not broken fixtures.
+                    let parsed: serde_json::Value = serde_json::from_str(&injected).unwrap();
+                    assert_eq!(parsed[field], value);
+                    assert!(
+                        serde_json::from_str::<TelemetryEventV2>(&injected).is_err(),
+                        "unknown event field accepted: {field}"
+                    );
+                    let mut wrapped = serde_json::to_value(envelope(valid.clone())).unwrap();
+                    wrapped["event"] = parsed;
+                    assert!(serde_json::from_value::<TelemetryEnvelopeV2>(wrapped).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn malformed_identity_date_and_version_are_rejected() {
         let mut event = envelope(TelemetryEventV2::Heartbeat(HeartbeatMetrics {
             distribution_channel: DistributionChannel::Cargo,
@@ -608,5 +684,54 @@ mod tests {
     fn pseudonymous_ids_never_accept_raw_identifiers() {
         assert!(PseudonymousId::new("customer@example.com").is_err());
         assert!(PseudonymousId::new(format!("hmac-sha256:{}", "a".repeat(64))).is_ok());
+    }
+
+    #[test]
+    fn pseudonymous_id_deserialization_preserves_constructor_invariant() {
+        for raw in [
+            "synthetic@example.invalid".to_owned(),
+            "/synthetic/private/identity".to_owned(),
+            String::new(),
+            format!("hmac-sha256:{}", "a".repeat(63)),
+            format!("hmac-sha256:{}", "A".repeat(64)),
+            format!("hmac-sha256:{}", "g".repeat(64)),
+        ] {
+            assert!(PseudonymousId::new(raw.clone()).is_err());
+            let encoded = serde_json::to_string(&raw).unwrap();
+            let result = serde_json::from_str::<PseudonymousId>(&encoded);
+            assert!(result.is_err(), "constructor invariant bypassed on wire");
+            let message = result.unwrap_err().to_string();
+            assert!(message.starts_with("invalid pseudonymous ID"));
+            if !raw.is_empty() {
+                assert!(!message.contains(&raw));
+            }
+        }
+        let raw = format!("hmac-sha256:{}", "a".repeat(64));
+        let encoded = serde_json::to_string(&raw).unwrap();
+        let decoded: PseudonymousId = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, PseudonymousId::new(raw).unwrap());
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+    }
+
+    #[test]
+    fn envelope_rejects_raw_pseudonymous_ids_before_semantic_validation() {
+        let event = envelope(TelemetryEventV2::SetupCompleted(OccurrenceMetrics {
+            count: 1,
+        }));
+        for field in ["account_id", "organization_id"] {
+            let mut wire = serde_json::to_value(&event).unwrap();
+            wire[field] = serde_json::json!("synthetic@example.invalid");
+            assert!(serde_json::from_value::<TelemetryEnvelopeV2>(wire).is_err());
+        }
+        let mut event_with_ids = event;
+        event_with_ids.account_id =
+            Some(PseudonymousId::new(format!("hmac-sha256:{}", "a".repeat(64))).unwrap());
+        event_with_ids.organization_id =
+            Some(PseudonymousId::new(format!("hmac-sha256:{}", "b".repeat(64))).unwrap());
+        let encoded = serde_json::to_vec(&event_with_ids).unwrap();
+        let decoded: TelemetryEnvelopeV2 = serde_json::from_slice(&encoded).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded, event_with_ids);
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), encoded);
     }
 }

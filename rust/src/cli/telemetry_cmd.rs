@@ -64,19 +64,84 @@ pub(super) fn cmd_telemetry(args: &[String]) {
     }
 }
 
+/// Why the effective send path is inactive despite the persisted preference.
+///
+/// The verdict itself always comes from [`config::TelemetryConfig::send_eligible`];
+/// this only explains a `false` from that same authority, reusing its own public
+/// predicates instead of re-interpreting the opt-out rules a second time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendBlocker {
+    /// Persisted opt-out: `telemetry off`, or a legacy `enabled = false`.
+    Preference,
+    /// `DO_NOT_TRACK=1`, or `LEAN_CTX_TELEMETRY=off|false|0|no`.
+    Environment,
+    /// The one-time default-on notice has not been processed yet.
+    Notice,
+    /// The authority refuses for a reason this display does not model yet.
+    Policy,
+}
+
+impl SendBlocker {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Preference => "off by your saved preference",
+            Self::Environment => "blocked by the environment (DO_NOT_TRACK / LEAN_CTX_TELEMETRY)",
+            Self::Notice => "waiting for the one-time notice",
+            Self::Policy => "blocked by telemetry policy",
+        }
+    }
+}
+
+/// Classifies a non-eligible state. `None` means the authority itself says the
+/// installation is send-eligible, so the order below never decides eligibility —
+/// it only picks the reason to show, most-persistent cause first.
+fn send_blocker(
+    telemetry: &config::TelemetryConfig,
+    do_not_track: Option<&str>,
+    env_override: Option<&str>,
+) -> Option<SendBlocker> {
+    if telemetry.send_eligible(do_not_track, env_override) {
+        return None;
+    }
+    if telemetry.explicitly_disabled() {
+        Some(SendBlocker::Preference)
+    } else if config::TelemetryConfig::environment_disables(do_not_track, env_override) {
+        Some(SendBlocker::Environment)
+    } else if !telemetry.notice_shown {
+        Some(SendBlocker::Notice)
+    } else {
+        Some(SendBlocker::Policy)
+    }
+}
+
 fn show_status() {
-    let cfg = config::Config::load();
+    // Global-only, like every path that actually sends (`show_payload`,
+    // `cloud_sync::cloud_background_tasks`): a project-local override would
+    // otherwise be shown as if it gated transmission.
+    let cfg = config::Config::load_global();
     let enabled = !cfg.telemetry.explicitly_disabled();
+    let blocker = send_blocker(
+        &cfg.telemetry,
+        std::env::var("DO_NOT_TRACK").ok().as_deref(),
+        std::env::var("LEAN_CTX_TELEMETRY").ok().as_deref(),
+    );
     let last = cfg.telemetry.last_heartbeat.as_deref().unwrap_or("never");
 
     println!(
-        "  Telemetry:  {}",
+        "  Preference: {}",
         if enabled {
             "\x1b[32menabled\x1b[0m"
         } else {
             "\x1b[2mdisabled\x1b[0m"
         }
     );
+    match blocker {
+        None => println!("  Sending:    \x1b[32mactive\x1b[0m"),
+        Some(reason) => println!(
+            "  Sending:    \x1b[2minactive — {}\x1b[0m",
+            reason.describe()
+        ),
+    }
 
     if let Ok(id) = installation_id::get_or_create() {
         println!("  Install ID: {}", installation_id::masked(&id));
@@ -345,5 +410,109 @@ mod tests {
         assert!(!should_show_default_on_notice(
             &disabled, true, false, None, None
         ));
+    }
+
+    /// Eligible state, and each reason the status line must be able to name.
+    #[test]
+    fn status_names_every_reason_sending_is_inactive() {
+        // Default-on but pre-notice: enabled as a preference, not yet sending.
+        let mut cfg = config::TelemetryConfig::default();
+        assert_eq!(send_blocker(&cfg, None, None), Some(SendBlocker::Notice));
+
+        cfg.notice_shown = true;
+        assert_eq!(send_blocker(&cfg, None, None), None);
+
+        assert_eq!(
+            send_blocker(&cfg, Some("1"), None),
+            Some(SendBlocker::Environment)
+        );
+        for value in ["off", "false", "0", "no", " OFF "] {
+            assert_eq!(
+                send_blocker(&cfg, None, Some(value)),
+                Some(SendBlocker::Environment),
+                "LEAN_CTX_TELEMETRY={value} must block sending"
+            );
+        }
+        // Only the exact opt-out spellings block; nothing else is invented here.
+        assert_eq!(send_blocker(&cfg, Some("0"), None), None);
+        assert_eq!(send_blocker(&cfg, None, Some("on")), None);
+
+        let disabled = config::TelemetryConfig {
+            preference: config::TelemetryPreference::ExplicitlyDisabled,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            send_blocker(&disabled, None, None),
+            Some(SendBlocker::Preference)
+        );
+        // A persisted opt-out is reported as such even when the environment
+        // would independently block the send.
+        assert_eq!(
+            send_blocker(&disabled, Some("1"), Some("off")),
+            Some(SendBlocker::Preference)
+        );
+
+        let legacy = config::TelemetryConfig {
+            enabled: false,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            send_blocker(&legacy, None, None),
+            Some(SendBlocker::Preference)
+        );
+    }
+
+    /// The display must never disagree with the eligibility authority: across
+    /// every reachable combination, "no blocker" is exactly `send_eligible`.
+    #[test]
+    fn status_never_contradicts_the_eligibility_authority() {
+        let preferences = [
+            config::TelemetryPreference::DefaultOn,
+            config::TelemetryPreference::ExplicitlyEnabled,
+            config::TelemetryPreference::ExplicitlyDisabled,
+        ];
+        let environments = [None, Some("0"), Some("1"), Some("off"), Some("no")];
+        for enabled in [true, false] {
+            for preference in preferences {
+                for notice_shown in [true, false] {
+                    for do_not_track in environments {
+                        for env_override in environments {
+                            let cfg = config::TelemetryConfig {
+                                enabled,
+                                preference,
+                                notice_shown,
+                                last_heartbeat: None,
+                            };
+                            assert_eq!(
+                                send_blocker(&cfg, do_not_track, env_override).is_none(),
+                                cfg.send_eligible(do_not_track, env_override),
+                                "disagreement for enabled={enabled} preference={preference:?} \
+                                 notice_shown={notice_shown} \
+                                 DO_NOT_TRACK={do_not_track:?} LEAN_CTX_TELEMETRY={env_override:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reporting status is read-only: it never rewrites the persisted choice.
+    #[test]
+    fn status_leaves_the_persisted_choice_untouched() {
+        let cfg = config::TelemetryConfig {
+            enabled: true,
+            preference: config::TelemetryPreference::ExplicitlyEnabled,
+            notice_shown: false,
+            last_heartbeat: Some("2026-09-20".to_string()),
+        };
+        let _ = send_blocker(&cfg, Some("1"), Some("off"));
+        assert!(cfg.enabled);
+        assert_eq!(
+            cfg.preference,
+            config::TelemetryPreference::ExplicitlyEnabled
+        );
+        assert!(!cfg.notice_shown);
+        assert_eq!(cfg.last_heartbeat.as_deref(), Some("2026-09-20"));
     }
 }

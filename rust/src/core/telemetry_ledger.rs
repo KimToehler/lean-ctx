@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Local append-only ledger of sent telemetry heartbeats.
 //!
 //! Every successful heartbeat is recorded as a JSON line in
@@ -8,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use fs2::FileExt;
+use super::telemetry_aggregate::lock_telemetry_file;
 
 const MAX_LEDGER_BYTES: u64 = 1_048_576;
 
@@ -41,9 +42,8 @@ pub(crate) fn append(record: &HeartbeatRecord) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create state dir: {e}"))?;
     }
     let lock = open_lock(&path)?;
-    lock.lock_exclusive()
-        .map_err(|e| format!("Cannot lock telemetry ledger: {e}"))?;
-    if read_paths(&path).iter().any(|existing| {
+    lock_telemetry_file(&lock, "ledger")?;
+    if read_paths(&path)?.iter().any(|existing| {
         !record.payload_hash.is_empty() && existing.payload_hash == record.payload_hash
     }) {
         return Ok(());
@@ -86,20 +86,20 @@ pub(crate) fn read_all() -> Vec<HeartbeatRecord> {
     let Ok(path) = ledger_path() else {
         return Vec::new();
     };
-    read_paths(&path)
+    read_paths(&path).unwrap_or_default()
 }
 
-pub(crate) fn latest_valid_version() -> Option<String> {
-    let path = ledger_path().ok()?;
+pub(crate) fn latest_valid_version() -> Result<Option<String>, String> {
+    let path = ledger_path()?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok()?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create state dir: {e}"))?;
     }
-    let lock = open_lock(&path).ok()?;
-    lock.lock_exclusive().ok()?;
-    read_paths(&path)
+    let lock = open_lock(&path)?;
+    lock_telemetry_file(&lock, "ledger")?;
+    Ok(read_paths(&path)?
         .into_iter()
         .rev()
-        .find_map(|record| (!record.version.is_empty()).then_some(record.version))
+        .find_map(|record| (!record.version.is_empty()).then_some(record.version)))
 }
 
 pub(crate) fn purge_local() -> Result<(), String> {
@@ -108,8 +108,7 @@ pub(crate) fn purge_local() -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create state dir: {e}"))?;
     }
     let lock = open_lock(&path)?;
-    lock.lock_exclusive()
-        .map_err(|e| format!("Cannot lock telemetry ledger: {e}"))?;
+    lock_telemetry_file(&lock, "ledger")?;
     for candidate in [&path, &rotated_path(&path)] {
         match std::fs::remove_file(candidate) {
             Ok(()) => {}
@@ -175,22 +174,76 @@ fn rotate(path: &std::path::Path) -> Result<(), String> {
     }
 }
 
-fn read_paths(path: &std::path::Path) -> Vec<HeartbeatRecord> {
-    [rotated_path(path), path.to_path_buf()]
-        .iter()
-        .filter_map(|candidate| std::fs::read_to_string(candidate).ok())
-        .flat_map(|content| {
+fn read_paths(path: &std::path::Path) -> Result<Vec<HeartbeatRecord>, String> {
+    let mut records = Vec::new();
+    for candidate in [rotated_path(path), path.to_path_buf()] {
+        let content = match std::fs::read_to_string(candidate) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("Cannot read telemetry ledger: {error}")),
+        };
+        records.extend(
             content
                 .lines()
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect::<Vec<_>>()
-        })
-        .collect()
+                .filter_map(|line| serde_json::from_str(line).ok()),
+        );
+    }
+    Ok(records)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs2::FileExt;
+
+    #[test]
+    fn contended_ledger_operations_return_without_mutating_records() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        let path = ledger_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let record = HeartbeatRecord {
+            timestamp: String::new(),
+            installation_id: String::new(),
+            version: "4".into(),
+            os: String::new(),
+            arch: String::new(),
+            schema_version: 2,
+            event_names: vec![],
+            payload_hash: "b".repeat(64),
+            endpoint: String::new(),
+            status: "success".into(),
+        };
+        append(&record).unwrap();
+        assert_eq!(latest_valid_version().unwrap().as_deref(), Some("4"));
+        let original = std::fs::read(&path).unwrap();
+        let blocker = open_lock(&path).unwrap();
+        blocker.lock_exclusive().unwrap();
+        let started = std::time::Instant::now();
+        assert!(append(&record).unwrap_err().contains("timed out"));
+        assert!(latest_valid_version().unwrap_err().contains("timed out"));
+        assert!(purge_local().unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        drop(blocker);
+        append(&record).unwrap();
+        assert_eq!(latest_valid_version().unwrap().as_deref(), Some("4"));
+        purge_local().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn unreadable_ledger_is_not_an_empty_history() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        let path = ledger_path().unwrap();
+        assert_eq!(latest_valid_version().unwrap(), None);
+        // A directory is unreadable as a ledger even under a privileged test user.
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(
+            latest_valid_version()
+                .unwrap_err()
+                .contains("Cannot read telemetry ledger")
+        );
+    }
 
     #[test]
     fn append_and_read_roundtrip() {

@@ -298,15 +298,19 @@ fn show_history() {
 }
 
 fn purge_local() {
-    match crate::core::telemetry_ledger::purge_local()
-        .and_then(|()| crate::core::telemetry_aggregate::purge_local_state())
-    {
+    match purge_local_history() {
         Ok(()) => println!("Local telemetry history purged."),
         Err(error) => {
             eprintln!("Failed to purge local telemetry history: {error}");
             std::process::exit(1);
         }
     }
+}
+
+fn purge_local_history() -> Result<(), String> {
+    crate::core::telemetry_aggregate::purge_local_state_then(
+        crate::core::telemetry_ledger::purge_local,
+    )
 }
 
 fn delete_remote() {
@@ -369,6 +373,32 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn purge_keeps_history_during_send_then_removes_all_local_telemetry() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        crate::core::telemetry_aggregate::record_current_version().unwrap();
+        let lease = crate::core::telemetry_aggregate::begin_daily_send().unwrap();
+        let pending = lease.batch().clone();
+        let state_dir = crate::core::paths::state_dir().unwrap();
+        let aggregate = state_dir.join("telemetry_v2_aggregate.json");
+        let one_shots = state_dir.join("telemetry_v2_one_shots.json");
+        assert!(aggregate.exists());
+        assert!(one_shots.exists());
+        let ledger = state_dir.join("telemetry_heartbeats.jsonl");
+        std::fs::write(&ledger, b"existing history\n").unwrap();
+        assert!(purge_local_history().unwrap_err().contains("timed out"));
+        assert_eq!(std::fs::read(&ledger).unwrap(), b"existing history\n");
+        drop(lease);
+        assert_eq!(
+            crate::core::telemetry_aggregate::preview_daily_batch().unwrap(),
+            pending
+        );
+        purge_local_history().unwrap();
+        assert!(!ledger.exists());
+        assert!(!aggregate.exists());
+        assert!(!one_shots.exists());
+    }
 
     #[test]
     fn default_notice_requires_an_eligible_interactive_run() {

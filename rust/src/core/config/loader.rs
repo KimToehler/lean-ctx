@@ -458,15 +458,36 @@ impl Config {
         Self::path().map_or_else(Self::default, |p| Self::load_global_from(&p))
     }
 
+    /// Strict variant of [`Config::load_global`]: an unreadable or unparseable
+    /// global config is an error instead of silently becoming the defaults.
+    /// Consent-gated paths (telemetry send) must use this so a corrupt file
+    /// never turns into default-on behaviour.
+    pub fn try_load_global() -> Result<Self, super::error::LeanCtxError> {
+        let path = Self::path().ok_or_else(|| {
+            super::error::LeanCtxError::Config("cannot determine home directory".into())
+        })?;
+        Self::try_load_global_from(&path)
+    }
+
+    pub(super) fn try_load_global_from(path: &Path) -> Result<Self, super::error::LeanCtxError> {
+        match std::fs::read_to_string(path) {
+            Ok(raw) if !raw.trim().is_empty() => toml::from_str(&raw).map_err(|error| {
+                super::error::LeanCtxError::Config(
+                    format!("refusing invalid global config.toml ({error})").into(),
+                )
+            }),
+            Ok(_) => Ok(Self::default()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Path-parameterized core of [`Config::load_global`] (unit-testable without
     /// the real config dir). Missing, empty, or unparseable files yield
     /// defaults; persisting callers that must not clobber a corrupt file use
     /// [`Config::update_global`], which refuses instead.
     pub(super) fn load_global_from(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(raw) if !raw.trim().is_empty() => toml::from_str(&raw).unwrap_or_default(),
-            _ => Self::default(),
-        }
+        Self::try_load_global_from(path).unwrap_or_default()
     }
 }
 

@@ -80,13 +80,15 @@ pub fn cloud_background_tasks() {
     // project-local override into the global config (#443).
     let mut config = Config::load_global();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let telemetry_bucket = crate::core::telemetry_aggregate::current_send_bucket();
 
     let already_heartbeated = config
         .telemetry
         .last_heartbeat
         .as_deref()
-        .is_some_and(|d| d == today)
-        || crate::core::telemetry_aggregate::last_sent_bucket().as_deref() == Some(&today);
+        .is_some_and(|d| d == telemetry_bucket)
+        || crate::core::telemetry_aggregate::last_sent_bucket().as_deref()
+            == Some(telemetry_bucket.as_str());
     let already_synced = config
         .cloud
         .last_sync

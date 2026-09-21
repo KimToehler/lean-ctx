@@ -115,6 +115,27 @@ Startverzögerung, kein blockierender Tool-Aufruf, kein Scheitern von
 Offline-Abläufen. Netzwerkfehler degradieren still mit Debug-Diagnose. Es wird
 kein Prozess je Ereignis gestartet.
 
+Der v2-Batch-Sender liest die globale Konfiguration und beide Abschaltvariablen
+direkt vor dem HTTP-Aufruf erneut. Ungültige Konfiguration, Opt-out und ein
+fehlender Hinweis verhindern diesen Aufruf; ein bereits laufender Request wird
+dadurch nicht rückwirkend abgebrochen. Der POST verwendet ein globales
+Transportlimit von zehn Sekunden.
+
+Neue Tagesbatches werden unter der Aggregate-Dateisperre anhand **eines
+UTC-Tagesbuckets** zugelassen und gestempelt. Ein bereits bestätigter Bucket
+wird nicht erneut erzeugt. Unbestätigte Batches behalten dagegen ihre exakten
+Bytes auch über Tageswechsel; die Zustellung ist deshalb **at least once**,
+nicht exactly once. Aggregate-, One-shot- und Ledger-Sperren verwenden einen
+750-ms-Akquisitionsetat. Bei Überlast bleibt eine Bestätigung wiederholbar;
+Lösch-/Rotationsbefehle müssen einen Sperrfehler melden. Das ist keine Frist
+für Dateisystem-I/O und keine Transaktion über sämtliche lokalen Dateien.
+Ein nicht lesbares oder belegtes Ledger gilt nicht als leere Versionshistorie;
+die Versionsbeobachtung kann nach Freigabe wiederholt werden. `purge-local`
+übernimmt zuerst die Aggregate-/One-shot-Sperren, bevor es das Ledger löscht.
+Scheitert der Ledger-Eintrag nach erfolgreichem Versand, bleibt der Batch
+unbestätigt und kann erneut übertragen werden, bis die lokale Historie wieder
+geschrieben werden kann; daraus folgt keine Exactly-once-Garantie.
+
 ## Vorhandener Engine-Stand
 
 - 20 typisierte Ereignisvarianten von `heartbeat` bis

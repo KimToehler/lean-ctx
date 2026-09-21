@@ -171,24 +171,38 @@ fn prepare_daily_batch() -> Result<TelemetryBatchV2, String> {
 
 /// Hold the cross-process state lease until network, ledger, and acknowledgement finish.
 pub fn begin_daily_send() -> Result<DailySendLease, String> {
+    begin_daily_send_in_bucket(None)
+}
+
+/// Resolve one UTC bucket under the lock for both admission and payload.
+/// Tests inject a fixed bucket; pending batches retain their original bytes.
+fn begin_daily_send_in_bucket(bucket: Option<&str>) -> Result<DailySendLease, String> {
     let path = state_path()?;
     let one_shot_path = one_shot_path()?;
     ensure_parent(&path)?;
     let lock = open_state_lock(&path)?;
-    lock.lock_exclusive()
-        .map_err(|error| format!("cannot lock telemetry aggregate state: {error}"))?;
+    lock_telemetry_file(&lock, "aggregate")?;
     let mut state = state_for_current_identity(load_state()?)?;
     let batch = if let Some(pending) = &state.pending {
+        // Retries remain at-least-once, including across UTC day boundaries.
         pending.batch.clone()
     } else {
+        // A caller-side precheck cannot serialize competing senders.
+        let bucket = match bucket {
+            Some(bucket) => bucket.to_string(),
+            None => current_send_bucket(),
+        };
+        if state.last_sent_bucket.as_deref() == Some(bucket.as_str()) {
+            return Err(format!(
+                "telemetry daily batch for {bucket} was already sent"
+            ));
+        }
         ensure_parent(&one_shot_path)?;
         let one_shot_lock = open_sidecar_lock(&one_shot_path)?;
-        one_shot_lock
-            .lock_exclusive()
-            .map_err(|error| format!("cannot lock telemetry one-shot state: {error}"))?;
+        lock_telemetry_file(&one_shot_lock, "one-shot")?;
         let one_shots = one_shots_for_current_identity(load_one_shots_at(&one_shot_path)?)?;
         let observed = current_checkpoint();
-        let batch = build_from_current_counters(&state, &observed, &one_shots.queued)?;
+        let batch = build_in_bucket(&state, &observed, &one_shots.queued, bucket)?;
         state.installation_id = batch_installation_id(&batch).to_string();
         state.pending = Some(PendingBatch {
             batch: batch.clone(),
@@ -265,6 +279,11 @@ pub fn last_sent_bucket() -> Option<String> {
         .and_then(|state| state.last_sent_bucket)
 }
 
+/// UTC bucket shared by payload generation and the background caller's precheck.
+pub(crate) fn current_send_bucket() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
+}
+
 fn state_for_current_identity(mut state: AggregateState) -> Result<AggregateState, String> {
     let (current, _) = installation_id::get_or_create_identity()
         .map_err(|error| format!("installation ID unavailable: {error}"))?;
@@ -295,13 +314,24 @@ fn build_from_current_counters(
     observed: &CounterCheckpoint,
     queued: &QueuedOneShots,
 ) -> Result<TelemetryBatchV2, String> {
+    build_in_bucket(state, observed, queued, current_send_bucket())
+}
+
+/// Build the payload for one explicit bucket. Split out so a caller that has
+/// already resolved the bucket under a lock stamps that exact value instead of
+/// reading the clock a second time.
+fn build_in_bucket(
+    state: &AggregateState,
+    observed: &CounterCheckpoint,
+    queued: &QueuedOneShots,
+    bucket: String,
+) -> Result<TelemetryBatchV2, String> {
     let (installation_id, deletion_token) = installation_id::get_or_create_identity()
         .map_err(|error| format!("installation ID unavailable: {error}"))?;
-    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     build_daily_aggregate(
         installation_id,
         hex::encode(sha2::Sha256::digest(deletion_token.as_bytes())),
-        date,
+        bucket,
         distribution_channel(),
         client_family(),
         state,
@@ -676,11 +706,12 @@ fn record_current_version_value(version: &str) -> Result<(), String> {
     let current = parse_major(version)
         .ok_or_else(|| "current app version has no valid major component".to_string())?;
     with_locked_one_shots(|mut state| {
-        let previous = state.observed_major.or_else(|| {
-            crate::core::telemetry_ledger::latest_valid_version()
+        let previous = match state.observed_major {
+            Some(previous) => Some(previous),
+            None => crate::core::telemetry_ledger::latest_valid_version()?
                 .as_deref()
-                .and_then(parse_major)
-        });
+                .and_then(parse_major),
+        };
         match previous {
             Some(previous) if current > previous => {
                 let from_major = state
@@ -714,14 +745,11 @@ pub fn purge_local_state_then<T>(
     let path = state_path()?;
     ensure_parent(&path)?;
     let lock = open_state_lock(&path)?;
-    lock.lock_exclusive()
-        .map_err(|error| format!("cannot lock telemetry aggregate state: {error}"))?;
+    lock_telemetry_file(&lock, "aggregate")?;
     let one_shot_path = one_shot_path()?;
     ensure_parent(&one_shot_path)?;
     let one_shot_lock = open_sidecar_lock(&one_shot_path)?;
-    one_shot_lock
-        .lock_exclusive()
-        .map_err(|error| format!("cannot lock telemetry one-shot state: {error}"))?;
+    lock_telemetry_file(&one_shot_lock, "one-shot")?;
     remove_state_file(&path, "aggregate")?;
     remove_state_file(&one_shot_path, "one-shot")?;
     operation()
@@ -734,12 +762,9 @@ pub fn rotate_identity_state_then<T>(
     let one_shot_path = one_shot_path()?;
     ensure_parent(&path)?;
     let lock = open_state_lock(&path)?;
-    lock.lock_exclusive()
-        .map_err(|error| format!("cannot lock telemetry aggregate state: {error}"))?;
+    lock_telemetry_file(&lock, "aggregate")?;
     let one_shot_lock = open_sidecar_lock(&one_shot_path)?;
-    one_shot_lock
-        .lock_exclusive()
-        .map_err(|error| format!("cannot lock telemetry one-shot state: {error}"))?;
+    lock_telemetry_file(&one_shot_lock, "one-shot")?;
     let mut one_shots = one_shots_for_current_identity(load_one_shots_at(&one_shot_path)?)?;
     write_one_shots(&one_shot_path, &one_shots)?;
     let value = operation()?;
@@ -834,8 +859,7 @@ fn with_locked_one_shots<T>(
     let path = one_shot_path()?;
     ensure_parent(&path)?;
     let lock = open_sidecar_lock(&path)?;
-    lock.lock_exclusive()
-        .map_err(|error| format!("cannot lock telemetry one-shot state: {error}"))?;
+    lock_telemetry_file(&lock, "one-shot")?;
     let state = one_shots_for_current_identity(load_one_shots_at(&path)?)?;
     let (state, value) = operation(state)?;
     write_one_shots(&path, &state)?;
@@ -849,8 +873,7 @@ fn acknowledge_one_shots_at(
 ) -> Result<(), String> {
     ensure_parent(path)?;
     let lock = open_sidecar_lock(path)?;
-    lock.lock_exclusive()
-        .map_err(|error| format!("cannot lock telemetry one-shot state: {error}"))?;
+    lock_telemetry_file(&lock, "one-shot")?;
     let mut state = one_shots_for_current_identity(load_one_shots_at(path)?)?;
     if state.last_acknowledged_batch.as_deref() == Some(acknowledgement_id) {
         return Ok(());
@@ -982,6 +1005,31 @@ fn open_sidecar_lock(path: &std::path::Path) -> Result<std::fs::File, String> {
     open_state_lock(path)
 }
 
+/// Contention fails without mutating state; failed acknowledgements keep the
+/// frozen batch retryable. This bounds acquisition, not filesystem I/O.
+const SEND_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+const SEND_LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Shared acquisition for aggregate, one-shot and ledger locks, in that order.
+pub(super) fn lock_telemetry_file(file: &std::fs::File, kind: &str) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + SEND_LOCK_TIMEOUT;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(error) if super::file_lock::is_contended(&error) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "telemetry {kind} lock timed out after {}ms; another operation is active",
+                        SEND_LOCK_TIMEOUT.as_millis()
+                    ));
+                }
+                std::thread::sleep(SEND_LOCK_RETRY_INTERVAL);
+            }
+            Err(error) => return Err(format!("cannot lock telemetry {kind} state: {error}")),
+        }
+    }
+}
+
 pub fn build_daily_heartbeat(
     installation_id: String,
     deletion_token_hash: String,
@@ -1039,645 +1087,4 @@ fn client_family() -> ClientFamily {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct TelemetryEnvGuard(Option<std::ffi::OsString>);
-
-    impl TelemetryEnvGuard {
-        fn disable() -> Self {
-            let previous = std::env::var_os("LEAN_CTX_TELEMETRY");
-            crate::test_env::set_var("LEAN_CTX_TELEMETRY", "off");
-            Self(previous)
-        }
-    }
-
-    impl Drop for TelemetryEnvGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(value) => crate::test_env::set_var("LEAN_CTX_TELEMETRY", value),
-                None => crate::test_env::remove_var("LEAN_CTX_TELEMETRY"),
-            }
-        }
-    }
-
-    fn tool_counts(batch: &TelemetryBatchV2) -> (u64, u64) {
-        batch
-            .events
-            .iter()
-            .find_map(|envelope| match &envelope.event {
-                TelemetryEventV2::ToolUsageAggregate(metrics) => {
-                    Some((metrics.calls, metrics.failures))
-                }
-                _ => None,
-            })
-            .expect("tool aggregate")
-    }
-
-    fn occurrence_count(batch: &TelemetryBatchV2, name: &str) -> Option<u64> {
-        batch
-            .events
-            .iter()
-            .find_map(|envelope| match &envelope.event {
-                TelemetryEventV2::SetupCompleted(metrics) if name == "setup_completed" => {
-                    Some(metrics.count)
-                }
-                TelemetryEventV2::IntegrationDetected(metrics)
-                    if name == "integration_detected" =>
-                {
-                    Some(metrics.count)
-                }
-                TelemetryEventV2::CheckoutStarted(metrics) if name == "checkout_started" => {
-                    Some(metrics.count)
-                }
-                _ => None,
-            })
-    }
-
-    fn version_transition(batch: &TelemetryBatchV2) -> Option<(u16, u16)> {
-        batch
-            .events
-            .iter()
-            .find_map(|envelope| match &envelope.event {
-                TelemetryEventV2::VersionUpgrade(metrics) => {
-                    Some((metrics.from_major, metrics.to_major))
-                }
-                _ => None,
-            })
-    }
-
-    fn sync_counts(batch: &TelemetryBatchV2) -> Option<(u64, u64, u64)> {
-        batch
-            .events
-            .iter()
-            .find_map(|envelope| match &envelope.event {
-                TelemetryEventV2::SyncAggregate(metrics) => {
-                    Some((metrics.attempts, metrics.successes, metrics.failures))
-                }
-                _ => None,
-            })
-    }
-
-    fn autopilot_counts(batch: &TelemetryBatchV2) -> Option<(u64, u64, u64)> {
-        batch
-            .events
-            .iter()
-            .find_map(|envelope| match &envelope.event {
-                TelemetryEventV2::AutopilotAggregate(metrics) => {
-                    Some((metrics.admitted, metrics.denied, metrics.fallback))
-                }
-                _ => None,
-            })
-    }
-
-    fn autopilot_fallback_counts(batch: &TelemetryBatchV2) -> Option<(u64, u64, u64)> {
-        batch
-            .events
-            .iter()
-            .find_map(|envelope| match &envelope.event {
-                TelemetryEventV2::AutopilotFallbackAggregate(metrics) => {
-                    Some((metrics.admitted, metrics.denied, metrics.fallback))
-                }
-                _ => None,
-            })
-    }
-
-    fn error_count(batch: &TelemetryBatchV2, category: ErrorCategory) -> Option<u64> {
-        batch
-            .events
-            .iter()
-            .find_map(|envelope| match &envelope.event {
-                TelemetryEventV2::ErrorCategoryAggregate(metrics)
-                    if metrics.category == category =>
-                {
-                    Some(metrics.count)
-                }
-                _ => None,
-            })
-    }
-
-    #[test]
-    fn daily_batch_is_typed_bounded_and_contains_no_runtime_content() {
-        let batch = build_daily_heartbeat(
-            "550e8400-e29b-41d4-a716-446655440000".into(),
-            "a".repeat(64),
-            "2026-09-09".into(),
-            DistributionChannel::Cargo,
-            ClientFamily::Codex,
-        )
-        .expect("valid batch");
-        let json = serde_json::to_string(&batch).expect("serialize batch");
-        assert!(batch.validate().is_ok());
-        for forbidden in [
-            "prompt",
-            "source_code",
-            "context_content",
-            "file_path",
-            "filename",
-            "command",
-            "argument",
-            "stdout",
-            "stderr",
-            "repository_url",
-            "task_text",
-            "issue_text",
-            "error_message",
-            "api_key",
-        ] {
-            assert!(
-                !json.contains(forbidden),
-                "forbidden key leaked: {forbidden}"
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_identity_is_rejected_before_send() {
-        assert!(
-            build_daily_heartbeat(
-                "raw-user-id".into(),
-                "a".repeat(64),
-                "2026-09-09".into(),
-                DistributionChannel::Unknown,
-                ClientFamily::Other,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn prepare_is_two_phase_and_preview_does_not_advance_state() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        crate::core::telemetry::global_metrics().record_tool_call(2_000, true);
-
-        let preview = preview_daily_batch().expect("preview");
-        assert!(!state_path().expect("state path").exists());
-        assert_eq!(tool_counts(&preview).1, 0);
-
-        let pending = prepare_daily_batch().expect("prepare");
-        crate::core::telemetry::global_metrics().record_tool_call(4_000, false);
-        assert_eq!(prepare_daily_batch().expect("retry"), pending);
-        assert_eq!(preview_daily_batch().expect("pending preview"), pending);
-
-        let mut wrong = pending.clone();
-        wrong.events[0].app_version.push_str("-different");
-        assert!(acknowledge_daily_batch(&wrong).is_err());
-        assert_eq!(prepare_daily_batch().expect("still pending"), pending);
-
-        acknowledge_daily_batch(&pending).expect("acknowledge");
-        let next = preview_daily_batch().expect("next preview");
-        assert_eq!(tool_counts(&next), (1, 1));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn preview_fails_fast_during_send_then_preserves_concurrent_counts() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        record_sync_result(false).expect("record included failure");
-        let lease = begin_daily_send().expect("begin send");
-        let error = preview_daily_batch().expect_err("preview must not race a send");
-        assert!(error.contains("send is in progress"));
-        record_sync_result(true).expect("record concurrent success");
-        lease.commit().expect("commit included failure");
-        let preview = preview_daily_batch().expect("preview after send");
-        assert_eq!(sync_counts(&preview), Some((1, 1, 0)));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn preview_fails_fast_during_sidecar_write_and_recovers() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        record_sync_result(true).expect("record result");
-        {
-            let path = one_shot_path().expect("sidecar path");
-            let lock = open_sidecar_lock(&path).expect("open lock");
-            lock.lock_exclusive().expect("hold writer lock");
-            let error = preview_daily_batch().expect_err("preview must not wait for writer");
-            assert!(error.contains("cannot lock one-shot state"));
-        }
-        assert_eq!(
-            sync_counts(&preview_daily_batch().expect("preview after writer exits")),
-            Some((1, 1, 0))
-        );
-    }
-
-    #[test]
-    fn histogram_edges_are_bounded_and_deterministic() {
-        let histogram = single_observation_histogram(51, &[10, 50, 100], MAX_COUNT + 1);
-        assert_eq!(histogram.upper_bounds, vec![10, 50, 100]);
-        assert_eq!(histogram.counts, vec![0, 0, MAX_COUNT]);
-        let capped = single_observation_histogram(101, &[10, 50, 100], 1);
-        assert_eq!(capped.counts, vec![0, 0, 1]);
-
-        let saturated = bounded_histogram_delta(&[MAX_COUNT; 9], &[0; 9]);
-        assert_eq!(saturated.iter().sum::<u64>(), MAX_COUNT);
-        assert_eq!(saturated[0], MAX_COUNT);
-        assert!(saturated[1..].iter().all(|count| *count == 0));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn send_lease_blocks_purge_until_send_finishes() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        let lease = begin_daily_send().expect("begin send");
-        let (tx, rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            tx.send(purge_local_state()).expect("report purge");
-        });
-        assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(50))
-                .is_err(),
-            "purge must wait for in-flight send lease"
-        );
-        drop(lease);
-        rx.recv_timeout(std::time::Duration::from_secs(2))
-            .expect("purge completed")
-            .expect("purge succeeded");
-        worker.join().expect("purge worker");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn one_shots_are_deduplicated_and_ack_only_included_watermarks() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        record_current_version_value("3.9.20").expect("seed major");
-        assert_eq!(
-            version_transition(&preview_daily_batch().expect("preview")),
-            None
-        );
-
-        record_setup_completion(vec!["Claude Code".into(), "Claude Code".into()])
-            .expect("record setup");
-        let first = prepare_daily_batch().expect("prepare first");
-        assert_eq!(occurrence_count(&first, "setup_completed"), Some(1));
-        assert_eq!(occurrence_count(&first, "integration_detected"), Some(1));
-
-        record_setup_completion(vec!["Claude Code".into(), "Codex".into()])
-            .expect("record later integration");
-        record_current_version_value("4.0.0").expect("record upgrade");
-        assert_eq!(prepare_daily_batch().expect("retry exact"), first);
-        acknowledge_daily_batch(&first).expect("ack first");
-
-        let second = prepare_daily_batch().expect("prepare second");
-        assert_eq!(occurrence_count(&second, "setup_completed"), None);
-        assert_eq!(occurrence_count(&second, "integration_detected"), Some(1));
-        assert_eq!(version_transition(&second), Some((3, 4)));
-        record_current_version_value("5.0.0").expect("record next upgrade while pending");
-        acknowledge_daily_batch(&second).expect("ack second");
-
-        let third = prepare_daily_batch().expect("prepare residual upgrade");
-        assert_eq!(version_transition(&third), Some((4, 5)));
-        acknowledge_daily_batch(&third).expect("ack residual upgrade");
-
-        record_current_version_value("2.0.0").expect("ignore downgrade");
-        let final_preview = preview_daily_batch().expect("final preview");
-        assert_eq!(occurrence_count(&final_preview, "setup_completed"), None);
-        assert_eq!(
-            occurrence_count(&final_preview, "integration_detected"),
-            None
-        );
-        assert_eq!(version_transition(&final_preview), None);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn setup_recording_does_not_wait_for_network_send_lease() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        let lease = begin_daily_send().expect("begin send");
-        let (tx, rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            tx.send(record_setup_completion(vec!["codex".into()]))
-                .expect("report setup recording");
-        });
-        rx.recv_timeout(std::time::Duration::from_secs(2))
-            .expect("setup recording must not wait for network lease")
-            .expect("setup recording succeeded");
-        drop(lease);
-        worker.join().expect("setup worker");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn setup_recording_respects_environment_opt_out() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        let _telemetry = TelemetryEnvGuard::disable();
-        record_setup_completion(vec!["codex".into()]).expect("opted-out recording is a no-op");
-        record_sync_result(true).expect("opted-out sync recording is a no-op");
-        record_autopilot_decisions(1, 1).expect("opted-out decision recording is a no-op");
-        record_autopilot_fallback().expect("opted-out fallback recording is a no-op");
-        record_checkout_started().expect("opted-out checkout recording is a no-op");
-        record_error_category(ErrorCategory::Internal)
-            .expect("opted-out error recording is a no-op");
-        assert!(!one_shot_path().expect("one-shot path").exists());
-        let preview = preview_daily_batch().expect("preview");
-        assert_eq!(occurrence_count(&preview, "setup_completed"), None);
-        assert_eq!(occurrence_count(&preview, "integration_detected"), None);
-        assert_eq!(sync_counts(&preview), None);
-        assert_eq!(autopilot_counts(&preview), None);
-        assert_eq!(autopilot_fallback_counts(&preview), None);
-        assert_eq!(occurrence_count(&preview, "checkout_started"), None);
-        assert_eq!(error_count(&preview, ErrorCategory::Internal), None);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn error_categories_are_typed_durable_and_ack_only_the_pending_snapshot() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        for category in ERROR_CATEGORIES {
-            record_error_category(category).expect("record error category");
-        }
-        let first = prepare_daily_batch().expect("prepare first");
-        for category in ERROR_CATEGORIES {
-            assert_eq!(error_count(&first, category), Some(1));
-        }
-
-        record_error_category(ErrorCategory::Timeout).expect("record concurrent timeout");
-        assert_eq!(prepare_daily_batch().expect("retry"), first);
-        acknowledge_daily_batch(&first).expect("ack first");
-
-        let residual = preview_daily_batch().expect("residual preview");
-        assert_eq!(error_count(&residual, ErrorCategory::Timeout), Some(1));
-        for category in ERROR_CATEGORIES {
-            if category != ErrorCategory::Timeout {
-                assert_eq!(error_count(&residual, category), None);
-            }
-        }
-        let json = serde_json::to_string(&residual).expect("serialize telemetry");
-        assert!(!json.contains("error message"));
-        assert!(!json.contains("stack"));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn error_category_counter_saturates_at_schema_bound() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        with_locked_one_shots(|mut state| {
-            state.queued.error_categories[7] = MAX_COUNT;
-            Ok((state, ()))
-        })
-        .expect("seed saturated counter");
-        record_error_category(ErrorCategory::Internal).expect("saturated recorder is a no-op");
-        assert_eq!(
-            error_count(
-                &preview_daily_batch().expect("preview"),
-                ErrorCategory::Internal
-            ),
-            Some(MAX_COUNT)
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn autopilot_results_are_durable_and_ack_only_the_pending_snapshot() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        record_autopilot_decisions(2, 1).expect("record decisions");
-        let first = prepare_daily_batch().expect("prepare first");
-        assert_eq!(autopilot_counts(&first), Some((2, 1, 0)));
-
-        record_autopilot_decisions(1, 2).expect("record concurrent decisions");
-        record_autopilot_fallback().expect("record concurrent fallback");
-        assert_eq!(prepare_daily_batch().expect("retry"), first);
-        acknowledge_daily_batch(&first).expect("ack first");
-
-        let residual = preview_daily_batch().expect("residual preview");
-        assert_eq!(autopilot_counts(&residual), Some((1, 2, 1)));
-        assert_eq!(autopilot_fallback_counts(&residual), Some((0, 0, 1)));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn checkout_starts_are_durable_and_ack_only_the_pending_snapshot() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        record_checkout_started().expect("record checkout");
-        let first = prepare_daily_batch().expect("prepare first");
-        assert_eq!(occurrence_count(&first, "checkout_started"), Some(1));
-
-        record_checkout_started().expect("record concurrent checkout");
-        assert_eq!(prepare_daily_batch().expect("retry"), first);
-        acknowledge_daily_batch(&first).expect("ack first");
-        assert_eq!(
-            occurrence_count(
-                &preview_daily_batch().expect("residual preview"),
-                "checkout_started"
-            ),
-            Some(1)
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn saturated_autopilot_counters_remain_bounded() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        with_locked_one_shots(|mut state| {
-            state.queued.autopilot = DecisionMetrics {
-                admitted: MAX_COUNT,
-                denied: MAX_COUNT,
-                fallback: MAX_COUNT,
-            };
-            state.queued.autopilot_fallback.fallback = MAX_COUNT;
-            state.queued.checkout_started = MAX_COUNT;
-            Ok((state, ()))
-        })
-        .expect("seed saturated autopilot counts");
-
-        record_autopilot_decisions(1, 1).expect("saturated decision recorder is a no-op");
-        record_autopilot_fallback().expect("saturated fallback recorder is a no-op");
-        record_checkout_started().expect("saturated checkout recorder is a no-op");
-        let preview = preview_daily_batch().expect("preview");
-        assert_eq!(
-            autopilot_counts(&preview),
-            Some((MAX_COUNT, MAX_COUNT, MAX_COUNT))
-        );
-        assert_eq!(autopilot_fallback_counts(&preview), Some((0, 0, MAX_COUNT)));
-        assert_eq!(
-            occurrence_count(&preview, "checkout_started"),
-            Some(MAX_COUNT)
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn sync_results_are_durable_and_ack_only_the_pending_snapshot() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        record_sync_result(true).expect("record success");
-        record_sync_result(false).expect("record failure");
-        let first = prepare_daily_batch().expect("prepare first");
-        assert_eq!(sync_counts(&first), Some((2, 1, 1)));
-
-        record_sync_result(true).expect("record concurrent success");
-        assert_eq!(prepare_daily_batch().expect("retry"), first);
-        acknowledge_daily_batch(&first).expect("ack first");
-        assert_eq!(
-            sync_counts(&preview_daily_batch().expect("residual preview")),
-            Some((1, 1, 0))
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn retry_after_sidecar_ack_crash_does_not_double_subtract_one_shots() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        record_sync_result(true).expect("record included sync result");
-        record_autopilot_decisions(1, 0).expect("record included decision");
-        let pending = prepare_daily_batch().expect("prepare pending batch");
-        let aggregate_path = state_path().expect("aggregate path");
-        let state = load_state_at(&aggregate_path).expect("load pending state");
-        let pending_state = state.pending.expect("pending batch");
-        let acknowledgement_id =
-            pending_acknowledgement_id(&pending_state).expect("compute acknowledgement id");
-        let included = pending_state.included_one_shots;
-
-        // Simulate a crash after the sidecar subtraction was persisted but before
-        // the aggregate pending marker was cleared.
-        acknowledge_one_shots_at(
-            &one_shot_path().expect("one-shot path"),
-            &included,
-            &acknowledgement_id,
-        )
-        .expect("persist sidecar acknowledgement");
-        record_sync_result(false).expect("record result after interrupted commit");
-        record_autopilot_decisions(0, 1).expect("record decision after interrupted commit");
-
-        acknowledge_daily_batch(&pending).expect("retry acknowledgement");
-        let residual = preview_daily_batch().expect("residual preview");
-        assert_eq!(sync_counts(&residual), Some((1, 0, 1)));
-        assert_eq!(autopilot_counts(&residual), Some((0, 1, 0)));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn distinct_pending_instances_with_identical_metrics_are_each_acknowledged() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        record_sync_result(true).expect("record first result");
-        let first = prepare_daily_batch().expect("prepare first batch");
-        let first_state = load_state().expect("load first state");
-        let first_pending = first_state.pending.expect("first pending");
-        let first_id = pending_acknowledgement_id(&first_pending).expect("first id");
-        acknowledge_daily_batch(&first).expect("ack first batch");
-
-        record_sync_result(true).expect("record identical second result");
-        let second = prepare_daily_batch().expect("prepare second batch");
-        let second_state = load_state().expect("load second state");
-        let second_pending = second_state.pending.expect("second pending");
-        let second_id = pending_acknowledgement_id(&second_pending).expect("second id");
-        assert_ne!(first_id, second_id);
-        acknowledge_daily_batch(&second).expect("ack second batch");
-        assert_eq!(
-            sync_counts(&preview_daily_batch().expect("final preview")),
-            None
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn saturated_sync_counter_remains_cross_field_consistent() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        with_locked_one_shots(|mut state| {
-            state.queued.sync = SyncMetrics {
-                attempts: MAX_COUNT,
-                successes: MAX_COUNT,
-                failures: 0,
-            };
-            Ok((state, ()))
-        })
-        .expect("seed saturated sync counts");
-
-        record_sync_result(false).expect("saturated recorder is a no-op");
-        assert_eq!(
-            sync_counts(&preview_daily_batch().expect("preview")),
-            Some((MAX_COUNT, MAX_COUNT, 0))
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn identity_rotation_requeues_installation_scoped_facts() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        record_setup_completion(vec!["codex".into(), "claude".into()]).expect("record setup");
-        let first = prepare_daily_batch().expect("prepare first");
-        acknowledge_daily_batch(&first).expect("ack first");
-        record_sync_result(true).expect("record old-identity sync");
-        record_autopilot_decisions(1, 1).expect("record old-identity decisions");
-        record_autopilot_fallback().expect("record old-identity fallback");
-        record_checkout_started().expect("record old-identity checkout");
-        record_error_category(ErrorCategory::Internal).expect("record old-identity error");
-
-        rotate_identity_state_then(|| Ok(())).expect("rotate state");
-        let replay = preview_daily_batch().expect("preview replay");
-        assert_eq!(occurrence_count(&replay, "setup_completed"), Some(1));
-        assert_eq!(occurrence_count(&replay, "integration_detected"), Some(2));
-        assert_eq!(sync_counts(&replay), None);
-        assert_eq!(autopilot_counts(&replay), None);
-        assert_eq!(autopilot_fallback_counts(&replay), None);
-        assert_eq!(occurrence_count(&replay, "checkout_started"), None);
-        assert_eq!(error_count(&replay, ErrorCategory::Internal), None);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn failed_identity_rotation_does_not_requeue_old_identity_facts() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        record_setup_completion(vec!["codex".into()]).expect("record setup");
-        let first = prepare_daily_batch().expect("prepare first");
-        acknowledge_daily_batch(&first).expect("ack first");
-
-        assert!(rotate_identity_state_then::<()>(|| Err("reset failed".into())).is_err());
-        let unchanged = preview_daily_batch().expect("preview unchanged state");
-        assert_eq!(occurrence_count(&unchanged, "setup_completed"), None);
-        assert_eq!(occurrence_count(&unchanged, "integration_detected"), None);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn legacy_pending_batch_is_discarded_after_identity_change() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        let stale = prepare_daily_batch().expect("prepare old identity batch");
-        let stale_id = batch_installation_id(&stale).to_string();
-        let path = state_path().expect("state path");
-        let legacy_state = load_state_at(&path).expect("load state");
-        let mut legacy_json = serde_json::to_value(legacy_state).expect("serialize legacy state");
-        legacy_json
-            .as_object_mut()
-            .expect("aggregate state object")
-            .remove("installation_id");
-        let bytes = serde_json::to_vec(&legacy_json).expect("encode legacy JSON");
-        crate::core::atomic_fs::try_atomic_write(&path, &bytes, None)
-            .expect("write legacy state without identity field");
-
-        let current_id = installation_id::reset().expect("rotate identity directly");
-        assert_ne!(current_id, stale_id);
-        let current = preview_daily_batch().expect("preview current identity");
-        assert_ne!(current, stale);
-        assert!(
-            current
-                .events
-                .iter()
-                .all(|event| event.installation_id == current_id)
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn stale_sidecar_discards_sync_but_requeues_setup_after_identity_change() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        record_setup_completion(vec!["codex".into()]).expect("record setup");
-        let first = prepare_daily_batch().expect("prepare first");
-        acknowledge_daily_batch(&first).expect("ack setup");
-        record_sync_result(true).expect("record old-identity sync");
-        record_autopilot_decisions(1, 1).expect("record old-identity decisions");
-        record_autopilot_fallback().expect("record old-identity fallback");
-        record_checkout_started().expect("record old-identity checkout");
-        record_error_category(ErrorCategory::Internal).expect("record old-identity error");
-
-        installation_id::reset().expect("simulate successful reset before sidecar cleanup");
-        let current = preview_daily_batch().expect("preview rebound sidecar");
-        assert_eq!(occurrence_count(&current, "setup_completed"), Some(1));
-        assert_eq!(occurrence_count(&current, "integration_detected"), Some(1));
-        assert_eq!(sync_counts(&current), None);
-        assert_eq!(autopilot_counts(&current), None);
-        assert_eq!(autopilot_fallback_counts(&current), None);
-        assert_eq!(occurrence_count(&current, "checkout_started"), None);
-        assert_eq!(error_count(&current, ErrorCategory::Internal), None);
-    }
-}
+mod tests;

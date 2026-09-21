@@ -7,6 +7,24 @@ codebase, defines the intended acquisition order, and records rules for async co
 
 ## 1. Global / Static Locks
 
+Telemetry OS-file locks follow aggregate → one-shot → ledger, skipping levels
+when not needed. A ledger operation never acquires either upstream lock.
+Send holds the aggregate lease across HTTP, ledger append and acknowledgement;
+acknowledgement takes the one-shot lock only after the ledger guard is released.
+Version recording may take ledger under one-shot; purge/rotation callbacks must
+not reacquire aggregate or one-shot. Each production acquisition has a 750-ms
+retry budget (preview uses an immediate try-lock); scheduling may delay return.
+The telemetry-v2 batch POST has a ten-second global transport timeout; this does
+not impose a deadline on filesystem I/O or promise cancellation of an in-flight
+request after opt-out. Its fresh config read takes no config writer/cache lock.
+An acknowledgement timeout preserves the frozen pending batch for at-least-once
+retry. A purge/rotation acquisition timeout invokes no callback; callers must
+report failure, not successful deletion. Existing later I/O/callback failures
+are not a multi-file transaction. Lock files are derived with `with_extension`
+from the aggregate, one-shot and heartbeat-ledger paths in the state directory.
+Version observation propagates an unavailable ledger rather than persisting a
+false first observation. CLI purge takes aggregate/one-shot before ledger purge.
+
 All `std::sync::Mutex` unless noted otherwise.
 
 | # | Lock | File | Type | Purpose |

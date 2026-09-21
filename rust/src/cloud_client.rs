@@ -467,11 +467,32 @@ pub fn submit_product_feedback(payload: &serde_json::Value) -> Result<String, St
 pub fn telemetry_v2_batch(
     batch: &crate::core::telemetry_v2::TelemetryBatchV2,
 ) -> Result<String, String> {
+    telemetry_v2_batch_with_timeout(batch, std::time::Duration::from_secs(10))
+}
+
+fn telemetry_v2_batch_with_timeout(
+    batch: &crate::core::telemetry_v2::TelemetryBatchV2,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    // A sender may have waited for another lease since its initial precheck.
+    let config = crate::core::config::Config::try_load_global()
+        .map_err(|_| "Telemetry configuration unavailable".to_string())?;
+    let do_not_track = std::env::var("DO_NOT_TRACK").ok();
+    let telemetry_override = std::env::var("LEAN_CTX_TELEMETRY").ok();
+    if !config
+        .telemetry
+        .send_eligible(do_not_track.as_deref(), telemetry_override.as_deref())
+    {
+        return Err("Telemetry sending is disabled".to_string());
+    }
     batch
         .validate()
         .map_err(|error| format!("Telemetry validation failed: {error:?}"))?;
     let url = format!("{}/api/telemetry/v2/batch", api_url());
     let response = ureq::post(&url)
+        .config()
+        .timeout_global(Some(timeout))
+        .build()
         .header("Content-Type", "application/json")
         .send(&serde_json::to_vec(batch).map_err(|error| format!("JSON error: {error}"))?)
         .map_err(|error| format!("Telemetry v2 batch failed: {error}"))?;
@@ -970,6 +991,11 @@ fn parse_checkout_url(json: &serde_json::Value) -> Result<String, String> {
     let raw = json["url"]
         .as_str()
         .ok_or_else(|| "Billing did not return a checkout URL.".to_string())?;
+    // The URL is printed to the terminal and handed to the browser opener:
+    // control characters (CR/LF, ESC sequences) must never pass through.
+    if raw.chars().any(char::is_control) {
+        return Err("Billing returned an invalid checkout URL.".to_string());
+    }
     let parsed = reqwest::Url::parse(raw)
         .map_err(|_| "Billing returned an invalid checkout URL.".to_string())?;
     if parsed.scheme() != "https"
@@ -1312,188 +1338,5 @@ pub fn index_bundle_status() -> Result<serde_json::Value, String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::billing::Plan;
-    // Only the `#[cfg(unix)]` credential-permission tests still take the env lock
-    // directly; the plan-resolver tests use `isolated_data_dir()` (which locks
-    // internally). Gating the import keeps the Windows cross-compile warning-free.
-    #[cfg(unix)]
-    use crate::core::data_dir::test_env_lock;
-
-    #[test]
-    fn telemetry_delete_response_requires_explicit_confirmation() {
-        assert!(deletion_confirmed(200, r#"{"deleted":true}"#).unwrap());
-        assert!(!deletion_confirmed(204, "").unwrap());
-        assert!(!deletion_confirmed(200, r#"{"deleted":false}"#).unwrap());
-        assert!(deletion_confirmed(200, "not-json").is_err());
-    }
-
-    #[test]
-    fn checkout_response_requires_credential_free_absolute_https_url() {
-        assert_eq!(
-            parse_checkout_url(&serde_json::json!({
-                "url": "https://checkout.stripe.com/c/pay/test_session?prefilled_email=x"
-            }))
-            .unwrap(),
-            "https://checkout.stripe.com/c/pay/test_session?prefilled_email=x"
-        );
-        for response in [
-            serde_json::json!({}),
-            serde_json::json!({ "url": null }),
-            serde_json::json!({ "url": "" }),
-            serde_json::json!({ "url": "/checkout/session" }),
-            serde_json::json!({ "url": "http://checkout.stripe.com/session" }),
-            serde_json::json!({ "url": "https://user:secret@example.com/session" }),
-        ] {
-            assert!(
-                parse_checkout_url(&response).is_err(),
-                "accepted {response}"
-            );
-        }
-    }
-
-    #[test]
-    fn existing_card_publish_response_carries_recovery_challenge() {
-        let card: PublishedCard = serde_json::from_value(serde_json::json!({
-            "id": "card-1",
-            "url": "https://leanctx.com/w/card-1",
-            "edit_token_challenge": "nonce-1",
-            "challenge_expires_in_secs": 300
-        }))
-        .unwrap();
-        assert!(card.edit_token.is_none());
-        assert_eq!(card.edit_token_challenge.as_deref(), Some("nonce-1"));
-        assert_eq!(card.challenge_expires_in_secs, Some(300));
-        assert!(!card.account_claimed);
-    }
-
-    #[test]
-    fn grace_window_boundaries_are_inclusive_and_skew_safe() {
-        let now = 1_000_000_000;
-        let day = 86_400;
-        assert_eq!(plan_within_grace(now, now, 14), (true, 0));
-        // Exactly at the edge stays valid (inclusive).
-        assert_eq!(plan_within_grace(now - 14 * day, now, 14), (true, 14));
-        // One day past → expired.
-        assert_eq!(plan_within_grace(now - 15 * day, now, 14), (false, 15));
-        // Clock skew (future timestamp) is clamped to age 0, never negative.
-        assert_eq!(plan_within_grace(now + day, now, 14), (true, 0));
-    }
-
-    #[test]
-    fn plan_cache_roundtrips_through_json() {
-        let c = PlanCache {
-            plan: "pro".into(),
-            verified_at: 42,
-        };
-        let back: PlanCache = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
-        assert_eq!(back.plan, "pro");
-        assert_eq!(back.verified_at, 42);
-    }
-
-    #[test]
-    fn cached_resolve_grants_within_grace_then_expires_to_free() {
-        // Isolate all dirs (config + cache) so the resolver reads only the cache
-        // this test writes, not a developer's real plan cache.
-        let _iso = crate::core::data_dir::isolated_data_dir();
-
-        // A fresh save is served from cache, within grace, at full plan.
-        save_plan("pro").unwrap();
-        let eff = resolve_effective_plan_cached();
-        assert_eq!(eff.plan, Plan::Pro);
-        assert_eq!(eff.source, PlanSource::Cached);
-
-        // Backdate beyond grace → hosted entitlements fail closed to Free.
-        let stale = PlanCache {
-            plan: "pro".into(),
-            verified_at: now_unix() - (PLAN_GRACE_DAYS + 1) * 86_400,
-        };
-        std::fs::write(plan_cache_path(), serde_json::to_string(&stale).unwrap()).unwrap();
-        let eff = resolve_effective_plan_cached();
-        assert_eq!(eff.plan, Plan::Free);
-        assert_eq!(eff.source, PlanSource::Expired);
-    }
-
-    #[test]
-    fn no_cache_resolves_to_free_none() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        let eff = resolve_effective_plan_cached();
-        assert_eq!(eff.plan, Plan::Free);
-        assert_eq!(eff.source, PlanSource::None);
-    }
-
-    // P0-2 (#414): credentials must be owner-only on disk.
-    #[cfg(unix)]
-    #[test]
-    fn credentials_are_written_owner_only_and_atomic() {
-        use std::os::unix::fs::PermissionsExt;
-        let _env = test_env_lock();
-        let tmp = tempfile::tempdir().unwrap();
-        crate::test_env::set_var("LEAN_CTX_DATA_DIR", tmp.path());
-
-        save_credentials("sk-test-key", "user-1", "a@b.c").unwrap();
-
-        let path = credentials_path();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "credentials.json must be 0o600");
-
-        let dir_mode = std::fs::metadata(config_dir())
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(
-            dir_mode & 0o077,
-            0,
-            "cloud dir must not be group/world accessible"
-        );
-
-        // No tmp file leftovers from the atomic write.
-        let leftovers: Vec<_> = std::fs::read_dir(config_dir())
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
-            .collect();
-        assert!(leftovers.is_empty(), "atomic write must not leak tmp files");
-
-        crate::test_env::remove_var("LEAN_CTX_DATA_DIR");
-    }
-
-    // P0-2 (#414): pre-existing world-readable credentials are tightened on load.
-    #[cfg(unix)]
-    #[test]
-    fn loose_credential_permissions_are_tightened_on_load() {
-        use std::os::unix::fs::PermissionsExt;
-        let _env = test_env_lock();
-        let tmp = tempfile::tempdir().unwrap();
-        crate::test_env::set_var("LEAN_CTX_DATA_DIR", tmp.path());
-
-        std::fs::create_dir_all(config_dir()).unwrap();
-        let path = credentials_path();
-        std::fs::write(&path, "{}").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        let _ = load_credentials();
-
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(
-            mode & 0o777,
-            0o600,
-            "legacy file must be tightened to 0o600"
-        );
-
-        crate::test_env::remove_var("LEAN_CTX_DATA_DIR");
-    }
-
-    #[test]
-    fn legacy_plan_txt_is_migrated_but_treated_as_stale() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        // Only the legacy flat file exists (no timestamp) → past grace until refresh.
-        std::fs::create_dir_all(config_dir()).unwrap();
-        std::fs::write(config_dir().join("plan.txt"), "team").unwrap();
-        let cache = cached_plan().unwrap();
-        assert_eq!(cache.plan, "team");
-        assert_eq!(cache.verified_at, 0);
-        assert_eq!(resolve_effective_plan_cached().source, PlanSource::Expired);
-    }
-}
+#[path = "cloud_client/inline_tests.rs"]
+mod tests;

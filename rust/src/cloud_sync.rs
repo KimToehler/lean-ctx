@@ -800,7 +800,7 @@ mod tests {
             ]),
             AutoSyncOutcome::Gated
         );
-        // All failed without a 402 → offline, keep the slot open.
+        // All failed without a 401 or 402 → offline, keep the slot open.
         assert_eq!(
             classify_outcomes(&[Err("connection refused".into()), Err("timeout".into()),]),
             AutoSyncOutcome::NetworkFailure

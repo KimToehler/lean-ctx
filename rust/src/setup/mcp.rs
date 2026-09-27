@@ -70,7 +70,7 @@ pub(crate) fn configure_agent_mcp_with_rule_steering(
     // Prefer HOME/USERPROFILE (dirs::home_dir ignores env on Windows).
     let home = crate::core::home::resolve_home_dir()
         .ok_or_else(|| "Cannot determine home directory".to_string())?;
-    let binary = resolve_portable_binary();
+    let binary = resolve_agent_binary();
 
     let targets = agent_mcp_targets(agent, &home)?;
 

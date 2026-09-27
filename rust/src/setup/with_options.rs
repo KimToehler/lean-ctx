@@ -1,7 +1,7 @@
 use chrono::Utc;
 
 use crate::core::editor_registry::{EditorTarget, WriteAction, WriteOptions};
-use crate::core::portable_binary::resolve_portable_binary;
+use crate::core::portable_binary::resolve_agent_binary;
 use crate::core::setup_report::{PlatformInfo, SetupItem, SetupReport, SetupStepReport};
 use crate::hooks::{HookMode, recommend_hook_mode};
 
@@ -15,7 +15,7 @@ pub fn run_setup_with_options(opts: SetupOptions) -> Result<SetupReport, String>
     let started_at = Utc::now();
     let home = crate::core::home::resolve_home_dir()
         .ok_or_else(|| "Cannot determine home directory".to_string())?;
-    let binary = resolve_portable_binary();
+    let binary = resolve_agent_binary();
     let home_str = home.to_string_lossy().to_string();
 
     // Commit to the XDG layout (and drain any residual ~/.lean-ctx) so a stray

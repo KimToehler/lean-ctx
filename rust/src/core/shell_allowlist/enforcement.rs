@@ -19,11 +19,15 @@ pub fn check_shell_allowlist(command: &str) -> Result<(), ShellError> {
     match ShellSecurity::resolve() {
         ShellSecurity::Off => Ok(()),
         ShellSecurity::Warn => {
+            // Advisory only, like the substitution finding (#1866): at `warn`
+            // it lands in the wrapped command's stderr, i.e. in the agent's
+            // tool result, and the command runs. The enforce text ("blocked,
+            // permanent, do not retry") would tell the agent the opposite (#1874).
             if let Err(msg) = enforce_shell_allowlist(command) {
-                tracing::warn!(
+                tracing::info!(
                     target: "shell_security",
-                    "warn-only: would block ({})",
-                    msg.lines().next().unwrap_or("blocked")
+                    "warn-only: shell_security=enforce would block this command; it ran ({})",
+                    warn_only_reason(msg.message())
                 );
             }
             Ok(())
@@ -36,6 +40,21 @@ pub fn check_shell_allowlist(command: &str) -> Result<(), ShellError> {
             );
         }),
     }
+}
+
+/// The reason of an enforce-mode block message, without the wording that only
+/// holds when the command was actually stopped (#1874).
+#[must_use]
+pub fn warn_only_reason(msg: &str) -> &str {
+    let first = msg.lines().next().unwrap_or_default();
+    let reason = first
+        .strip_prefix("[BLOCKED — DO NOT RETRY] ")
+        .unwrap_or(first);
+    reason
+        .split(" This is a permanent restriction")
+        .next()
+        .unwrap_or(reason)
+        .trim_end()
 }
 
 /// True when `command` would pass the allowlist / dangerous-pattern checks in

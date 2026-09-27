@@ -95,7 +95,7 @@ fn build_and_persist_fix_report(
         warnings: Vec::new(),
         errors: Vec::new(),
     };
-    let binary = crate::core::portable_binary::resolve_portable_binary();
+    let binary = crate::core::portable_binary::resolve_agent_binary();
     // #281: doctor --fix must not (re)register the MCP server when the user opted
     // out via `auto_update_mcp = false`. Hooks/rules/scope repair still runs.
     let update_mcp = crate::core::config::Config::load()

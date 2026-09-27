@@ -118,6 +118,30 @@ mod root_resolution_tests {
     fn resolve_search_root_errors_on_missing_path() {
         assert!(resolve_search_root("/definitely/not/here/xyzzy-7f3a91").is_err());
     }
+
+    #[test]
+    fn a_pinned_root_does_not_claim_another_projects_path() {
+        // #1875: with project A pinned, a search rooted in project B must hit
+        // B's corpus — the pin used to win for every path.
+        let _lock = crate::core::data_dir::test_env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::core::pathutil::safe_canonicalize_or_self(tmp.path());
+        let (a, b) = (base.join("project_a"), base.join("project_b"));
+        for p in [&a, &b] {
+            std::fs::create_dir_all(p.join(".git")).unwrap();
+        }
+        std::fs::create_dir_all(b.join("src")).unwrap();
+
+        crate::test_env::set_var("LEAN_CTX_PROJECT_ROOT", a.to_string_lossy().as_ref());
+        let from_b = resolve_search_root(&b.to_string_lossy());
+        let from_b_sub = resolve_search_root(&b.join("src").to_string_lossy());
+        let from_a = resolve_search_root(&a.to_string_lossy());
+        crate::test_env::remove_var("LEAN_CTX_PROJECT_ROOT");
+
+        assert_eq!(from_b.unwrap(), (b.clone(), None));
+        assert_eq!(from_b_sub.unwrap(), (b, Some("src".to_string())));
+        assert_eq!(from_a.unwrap(), (a, None), "paths inside the pin keep it");
+    }
 }
 
 #[cfg(all(test, feature = "embeddings"))]

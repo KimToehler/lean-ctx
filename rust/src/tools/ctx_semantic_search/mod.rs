@@ -66,7 +66,7 @@ pub fn handle(
         }
     };
     if index.doc_count == 0 {
-        return "No code files found to index.".to_string();
+        return format!("No code files found to index in {}.", root.display());
     }
 
     match mode.as_str() {
@@ -94,7 +94,7 @@ pub fn handle(
                 )
             } else {
                 format!(
-                    "{}: \"{}\" ({} results from {} indexed chunks)\n",
+                    "{}: \"{}\" ({} results from {} indexed chunks in {})\n",
                     if degraded {
                         "Lexical search (BM25 — dense index not built, \
                          run: lean-ctx index build-semantic)"
@@ -104,6 +104,7 @@ pub fn handle(
                     truncate_query(query, 60),
                     results.len(),
                     index.doc_count,
+                    root.display(),
                 )
             };
             format!("{header}{}", format_search_results(&results, compact))

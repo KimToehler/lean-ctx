@@ -465,7 +465,7 @@ fn register_mcp(agent: WrapAgent, home: &Path) -> Result<(), String> {
         .iter()
         .find(|target| target.agent_key == agent.as_str())
         .ok_or_else(|| format!("no MCP configuration is known for {}", agent.display_name()))?;
-    let binary = crate::core::portable_binary::resolve_portable_binary();
+    let binary = crate::core::portable_binary::resolve_agent_binary();
 
     // Claude's official `mcp add-json` may update state outside ~/.claude.json.
     // This command promises a reversible file edit, so force the registry writer

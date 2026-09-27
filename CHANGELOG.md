@@ -3,6 +3,51 @@
 All notable changes to lean-ctx are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed — MCP configs survive package-manager updates
+
+- Scoop, Homebrew, npm and mise run lean-ctx from a versioned directory that
+  the next update removes. `setup`, `init`, `doctor --fix` and `wrap` wrote
+  that directory into every agent's MCP `command` and hooks, so after an
+  update the agent pointed at a deleted binary (#1873). They now write the
+  stable launcher on `PATH` (the Scoop shim, the Homebrew symlink), as the
+  shell hooks already did since #1851. `lean-ctx doctor` reports an old
+  versioned path as drift, and `lean-ctx doctor --fix` rewrites it.
+
+### Fixed — `ctx_search query=` searches the session's project
+
+- With `project_root` pinned in `config.toml` (or `LEAN_CTX_PROJECT_ROOT`),
+  the BM25 form of `ctx_search` (`query=`, `action=semantic`, and the
+  "Ranked files" section of `ctx_compose`) searched the pinned project's
+  corpus from any session, while `action=regex` and `action=symbol` searched
+  the session's own project (#1875). A pinned root now applies only to paths
+  inside it. The result header names the root it searched
+  (`… from 1994 indexed chunks in /path/to/project`).
+
+### Fixed — concurrent identical `ctx_shell` calls all get their answer
+
+- Two or more identical foreground `ctx_shell` calls issued at once share one
+  job. The first to finish removed it, so the others waited until their soft
+  cap and returned "detached" with a job id that no longer existed (#1876).
+  The job is now removed only after every waiting call has read it, and never
+  while a background caller can still poll it by id. A call that arrives
+  after the shared job finished but before its result was read joins that
+  result instead of replacing the entry, which lost the answer for fast
+  commands such as `true`.
+
+### Fixed — warn-only shell findings no longer read as a block
+
+- With `shell_security = "warn"`, a command outside the allowlist runs, but
+  the log line was the enforce-mode block message ("BLOCKED — DO NOT RETRY
+  … permanent restriction") at WARN level (#1874). It is now logged at INFO
+  as `warn-only: … it ran (<reason>)`.
+
+### Fixed — `lean-ctx serve --help` prints real line breaks
+
+- The option list printed literal `\n\` sequences on one line. It is now one
+  option per line.
+
 ## [3.10.4] — 2026-09-26
 
 ### Fixed — `lean-ctx update --help` no longer installs an update

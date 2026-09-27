@@ -3,7 +3,7 @@
 All notable changes to lean-ctx are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [3.10.5] — 2026-09-27
 
 ### Fixed — MCP configs survive package-manager updates
 

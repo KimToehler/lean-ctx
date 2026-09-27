@@ -295,7 +295,7 @@ fn release_foreground(id: &str, detached: bool) {
     }
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 pub(crate) fn remove_for_test(id: &str) {
     JOBS.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

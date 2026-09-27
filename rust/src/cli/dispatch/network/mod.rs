@@ -510,26 +510,26 @@ pub(super) fn cmd_serve(rest: &[String]) {
                 }
                 "--help" | "-h" => {
                     eprintln!(
-                        "Usage: lean-ctx serve [--host H] [--port N] [--project-root DIR] [--daemon] [--stop] [--status]\\n\\
-                         \\n\\
-                         Options:\\n\\
-                           --daemon, -d          Start as background daemon (UDS)\\n\\
-                           --stop                Stop running daemon\\n\\
-                           --status              Show daemon status\\n\\
-                           --host, -H            Bind host (default: 127.0.0.1)\\n\\
-                           --port, -p            Bind port (default: 8080)\\n\\
-                           --project-root        Resolve relative paths against this root (default: cwd)\\n\\
-                           --root PATH[:ALIAS]   Add a repo root for multi-repo mode (repeatable)\\n\\
-                           --rrf-k N             RRF fusion parameter (default: 60.0)\\n\\
-                           --auth-token          Require Authorization: Bearer <token> (required for non-loopback binds)\\n\\
-                           --stateful/--stateless  Streamable HTTP session mode (default: stateless)\\n\\
-                           --json/--sse          Response framing in stateless mode (default: json)\\n\\
-                           --max-body-bytes      Max request body size in bytes (default: 2097152)\\n\\
-                           --max-concurrency     Max concurrent requests (default: 32)\\n\\
-                           --max-rps             Max requests/sec (global, default: 50)\\n\\
-                           --rate-burst          Rate limiter burst (global, default: 100)\\n\\
-                           --request-timeout-ms  REST tool-call timeout (default: 30000)\\n\\
-                           --allowed-host        Add allowed Host header (repeatable)\\n\\
+                        "Usage: lean-ctx serve [--host H] [--port N] [--project-root DIR] [--daemon] [--stop] [--status]\n\
+                         \n\
+                         Options:\n  \
+                           --daemon, -d          Start as background daemon (UDS)\n  \
+                           --stop                Stop running daemon\n  \
+                           --status              Show daemon status\n  \
+                           --host, -H            Bind host (default: 127.0.0.1)\n  \
+                           --port, -p            Bind port (default: 8080)\n  \
+                           --project-root        Resolve relative paths against this root (default: cwd)\n  \
+                           --root PATH[:ALIAS]   Add a repo root for multi-repo mode (repeatable)\n  \
+                           --rrf-k N             RRF fusion parameter (default: 60.0)\n  \
+                           --auth-token          Require Authorization: Bearer <token> (required for non-loopback binds)\n  \
+                           --stateful/--stateless  Streamable HTTP session mode (default: stateless)\n  \
+                           --json/--sse          Response framing in stateless mode (default: json)\n  \
+                           --max-body-bytes      Max request body size in bytes (default: 2097152)\n  \
+                           --max-concurrency     Max concurrent requests (default: 32)\n  \
+                           --max-rps             Max requests/sec (global, default: 50)\n  \
+                           --rate-burst          Rate limiter burst (global, default: 100)\n  \
+                           --request-timeout-ms  REST tool-call timeout (default: 30000)\n  \
+                           --allowed-host        Add allowed Host header (repeatable)\n  \
                            --disable-host-check  Disable Host header validation (unsafe)"
                     );
                     return;

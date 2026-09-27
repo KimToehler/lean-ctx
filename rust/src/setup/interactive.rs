@@ -1,5 +1,5 @@
 use crate::core::editor_registry::{WriteAction, WriteOptions};
-use crate::core::portable_binary::resolve_portable_binary;
+use crate::core::portable_binary::resolve_agent_binary;
 use crate::hooks::{HookMode, recommend_hook_mode};
 
 use super::first_run::{first_run_setup_level, persist_setup_choice};
@@ -41,7 +41,7 @@ pub fn run_setup() {
         std::process::exit(1);
     };
 
-    let binary = resolve_portable_binary();
+    let binary = resolve_agent_binary();
 
     let home_str = home.to_string_lossy().to_string();
 

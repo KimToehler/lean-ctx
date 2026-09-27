@@ -128,7 +128,7 @@ fn write_copilot_cli_home_mcp() {
         return;
     };
 
-    let binary = crate::core::portable_binary::resolve_portable_binary();
+    let binary = crate::core::portable_binary::resolve_agent_binary();
     let target = crate::core::editor_registry::EditorTarget {
         name: "Copilot CLI",
         agent_key: "copilot".to_string(),

@@ -243,12 +243,14 @@ fn allowlist_gate(command: &str) -> Option<i32> {
         }
         // Diagnostic, not user feedback: an interactive human at a TTY can run
         // the command without lean-ctx anyway, and surfacing a WARN in their
-        // plain terminal is exactly the confusion GH #699 reported. Keep the
-        // warning for non-TTY callers (agents that opted into warn-only).
+        // plain terminal is exactly the confusion GH #699 reported. A non-TTY
+        // caller that opted into warn-only gets it at info, without the enforce
+        // text ("blocked, do not retry") for a command that runs (#1874).
+        let reason = crate::core::shell_allowlist::warn_only_reason(msg.message());
         if io::stderr().is_terminal() {
-            tracing::debug!("[CLI] Command would be blocked in MCP mode: {msg}");
+            tracing::debug!("[CLI] Command would be blocked in MCP mode: {reason}");
         } else {
-            tracing::warn!("[CLI] Command would be blocked in MCP mode: {msg}");
+            tracing::info!("[CLI] Command would be blocked in MCP mode; it ran ({reason})");
         }
     }
     None

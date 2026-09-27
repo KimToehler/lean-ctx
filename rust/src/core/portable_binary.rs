@@ -87,6 +87,18 @@ pub(crate) fn stable_shell_binary(binary: &str) -> String {
     stable_shell_binary_in(binary, &path_dirs())
 }
 
+/// The binary path to write into agent configurations — MCP server `command`
+/// fields and agent hooks (#1873).
+///
+/// These outlive the running build just like the shell artifacts of #1851: a
+/// Scoop or Homebrew install runs from a versioned directory the next update
+/// removes, which left every configured MCP server pointing at a deleted
+/// binary. The stable launcher on `PATH` is used instead whenever the running
+/// binary is not itself on `PATH`.
+pub(crate) fn resolve_agent_binary() -> String {
+    stable_shell_binary(&resolve_portable_binary())
+}
+
 fn stable_shell_binary_in(binary: &str, path_dirs: &[std::path::PathBuf]) -> String {
     let path = std::path::Path::new(binary);
     if !path.is_absolute() || path.parent().is_some_and(|d| dir_on_path(d, path_dirs)) {
@@ -408,5 +420,35 @@ mod tests {
             assert_eq!(stable_shell_binary_in(&bin, &[tmp.path().join("x")]), bin);
             assert_eq!(stable_shell_binary_in("lean-ctx", &[]), "lean-ctx");
         }
+    }
+
+    /// #1873: a Scoop install runs from `apps\lean-ctx\<version>`, which the
+    /// next update removes; MCP configs must get the shim on PATH instead.
+    #[cfg(windows)]
+    #[test]
+    fn scoop_versioned_exe_resolves_to_the_shim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let apps = tmp.path().join("apps").join("lean-ctx").join("3.10.4");
+        let shims = tmp.path().join("shims");
+        for dir in [&apps, &shims] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("lean-ctx.exe"), b"").unwrap();
+        }
+        let exe = apps.join("lean-ctx.exe");
+        assert_eq!(
+            stable_shell_binary_in(&exe.to_string_lossy(), &[shims.clone()]),
+            sanitize_exe_path(&shims.join("lean-ctx.exe").to_string_lossy())
+        );
+    }
+
+    #[test]
+    fn agent_binary_is_absolute() {
+        // #1873: MCP hosts spawn `command` directly, so the stable-launcher
+        // mapping must never degrade the path to a bare name.
+        let resolved = resolve_agent_binary();
+        assert!(
+            std::path::Path::new(&resolved).is_absolute(),
+            "resolve_agent_binary must return an absolute path, got: {resolved}"
+        );
     }
 }

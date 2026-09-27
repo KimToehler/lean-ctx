@@ -57,3 +57,5 @@ mod tests_multiword;
 mod tests_pipe_target;
 #[cfg(test)]
 mod tests_tokenizer;
+#[cfg(test)]
+mod tests_warn_only;

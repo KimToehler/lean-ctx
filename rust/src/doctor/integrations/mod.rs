@@ -48,7 +48,7 @@ pub(super) fn run_integrations(opts: &IntegrationsOptions) -> i32 {
         eprintln!("Cannot determine home directory");
         return 2;
     };
-    let binary = crate::core::portable_binary::resolve_portable_binary();
+    let binary = crate::core::portable_binary::resolve_agent_binary();
     let data_dir = crate::core::data_dir::lean_ctx_data_dir()
         .map(|d| d.to_string_lossy().to_string())
         .unwrap_or_default();

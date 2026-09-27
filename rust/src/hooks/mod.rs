@@ -368,7 +368,7 @@ fn file_contains_lean_ctx(path: &std::path::Path) -> bool {
 /// there. Shell-executed hook commands go through
 /// [`resolve_hook_command_binary`], which honors the portable override (#708).
 fn resolve_binary_path() -> String {
-    crate::core::portable_binary::resolve_portable_binary()
+    crate::core::portable_binary::resolve_agent_binary()
 }
 
 /// Binary token for **shell-executed** hook commands (`<binary> hook rewrite`

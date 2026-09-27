@@ -11,7 +11,7 @@ mod unwrap;
 mod verify;
 
 use crate::core::editor_registry::{self, EditorTarget, WriteOptions};
-use crate::core::portable_binary::resolve_portable_binary;
+use crate::core::portable_binary::resolve_agent_binary;
 use crate::hooks::{self, HookMode};
 
 use snapshot::WrapSnapshot;
@@ -71,7 +71,7 @@ fn run_wrap_for_agent(agent_key: &str) {
         std::process::exit(1);
     }
 
-    let binary = resolve_portable_binary();
+    let binary = resolve_agent_binary();
     let mut snap = WrapSnapshot::new(agent_key);
 
     // --- Step 1: Snapshot existing configs ---

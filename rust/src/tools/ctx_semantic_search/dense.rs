@@ -171,10 +171,11 @@ pub(crate) fn hybrid_search_mode(
             )
         } else {
             format!(
-                "Semantic search (Hybrid): \"{}\" ({} results from {} indexed chunks, embeddings coverage {:.0}%)\n",
+                "Semantic search (Hybrid): \"{}\" ({} results from {} indexed chunks in {}, embeddings coverage {:.0}%)\n",
                 truncate_query(query, 60),
                 results.len(),
                 index.doc_count,
+                root.display(),
                 coverage * 100.0
             )
         };
@@ -213,10 +214,11 @@ pub(crate) fn hybrid_search_mode(
             )
         } else {
             format!(
-                "Semantic search (BM25{graph_tag}): \"{}\" ({} results from {} indexed chunks)\n",
+                "Semantic search (BM25{graph_tag}): \"{}\" ({} results from {} indexed chunks in {})\n",
                 truncate_query(query, 60),
                 results.len(),
                 index.doc_count,
+                root.display(),
             )
         };
         format!("{header}{}", format_search_results(&results, compact))
@@ -288,10 +290,11 @@ pub(crate) fn dense_search_mode(
             )
         } else {
             format!(
-                "Semantic search (Dense): \"{}\" ({} results from {} indexed chunks, embeddings coverage {:.0}%)\n",
+                "Semantic search (Dense): \"{}\" ({} results from {} indexed chunks in {}, embeddings coverage {:.0}%)\n",
                 truncate_query(query, 60),
                 results.len(),
                 index.doc_count,
+                root.display(),
                 coverage * 100.0
             )
         };

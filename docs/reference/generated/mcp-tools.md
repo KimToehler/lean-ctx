@@ -304,9 +304,10 @@ Parameters: `action`, `depth`, `format`, `path`, `root`
 Index orchestration — manage code graph index.
 WORKFLOW: status → build → build-full (escalate if stale).
 ANTI-PATTERN: build-full is expensive — use incremental build first.
-Actions: status (state), build (incremental), build-full (rebuild).
+Actions: status (state), build (incremental), build-full (rebuild),
+why (is `path` indexed? if not, the rule that dropped it).
 
-Parameters: `action`*, `project_root`
+Parameters: `action`*, `path`, `project_root`
 
 ## `ctx_intent`
 

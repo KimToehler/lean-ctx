@@ -16,7 +16,7 @@ pub fn read_file_nofollow(path: &str) -> Result<String, std::io::Error> {
             use std::io::Read;
             let mut buf = Vec::new();
             f.read_to_end(&mut buf)?;
-            Ok(String::from_utf8_lossy(&buf).into_owned())
+            Ok(crate::core::text_decode::decode(buf))
         }
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Err(std::io::Error::other(format!(
             "Symlink detected at {path} — refusing to follow (TOCTOU protection)"
@@ -37,27 +37,20 @@ pub fn read_file_nofollow(path: &str) -> Result<String, std::io::Error> {
             )));
         }
     }
-    std::fs::read_to_string(path)
+    std::fs::read(path).map(crate::core::text_decode::decode)
 }
 
-/// Reads a file as lossy UTF-8, rejecting binary files.
+/// Reads a file as text in any encoding (`text_decode`: UTF-8 with or without
+/// BOM, UTF-16 with BOM, Windows-1252), rejecting binary files. The BOM is
+/// stripped — leaking it corrupts the first line of every downstream view
+/// (limitations doc #11).
 /// Uses O_NOFOLLOW on Unix to prevent TOCTOU symlink attacks.
 pub fn read_file_lossy(path: &str) -> Result<String, std::io::Error> {
     if crate::core::binary_detect::is_binary_file(path) {
         let msg = crate::core::binary_detect::binary_file_message(path);
         return Err(std::io::Error::other(msg));
     }
-    read_file_nofollow(path).map(strip_utf8_bom)
-}
-
-/// A UTF-8 BOM is an encoding artifact, not content — leaking it corrupts the
-/// first line of every downstream view (limitations doc #11). Shared by both
-/// file readers (this module's and `tools::ctx_read::read_file_lossy`).
-pub fn strip_utf8_bom(s: String) -> String {
-    match s.strip_prefix('\u{feff}') {
-        Some(rest) => rest.to_owned(),
-        None => s,
-    }
+    read_file_nofollow(path)
 }
 
 /// Result of a file read with secret scanning applied.

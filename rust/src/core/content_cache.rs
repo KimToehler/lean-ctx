@@ -198,8 +198,9 @@ pub fn insert(path: &Path, state: FileState, content: Arc<str>) {
 }
 
 /// Read a file through the cache: returns cached content on a fresh hit, else
-/// reads from disk (UTF-8), populates the cache, and returns it. `None` on a
-/// non-UTF-8/unreadable/unstatable file. Convenience for callers without their
+/// reads from disk (any text encoding, see `text_decode`), populates the cache,
+/// and returns it. `None` on a
+/// binary/unreadable/unstatable file. Convenience for callers without their
 /// own size/special-file gating (the search-index build and `ctx_search` use
 /// the explicit [`get`]/[`insert`] pair so they keep their own skip rules).
 pub fn get_or_read(path: &Path) -> Option<Arc<str>> {
@@ -207,7 +208,7 @@ pub fn get_or_read(path: &Path) -> Option<Arc<str>> {
     if let Some(hit) = get(path, state) {
         return Some(hit);
     }
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = crate::core::text_decode::read_text(path).ok()?;
     let arc: Arc<str> = Arc::from(content);
     insert(path, state, Arc::clone(&arc));
     Some(arc)

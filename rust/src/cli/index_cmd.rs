@@ -183,9 +183,27 @@ pub(crate) fn cmd_index(args: &[String]) {
             }
         }
         Some("watch") => run_watcher(root),
+        Some("why") => {
+            let Some(file) = positional_after(args, "why") else {
+                eprintln!("Usage: lean-ctx index why <file> [--json] [--root <path>]");
+                std::process::exit(2);
+            };
+            let coverage = crate::core::bm25_index::coverage::explain(root, file);
+            if args.iter().any(|a| a == "--json") {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&coverage).unwrap_or_default()
+                );
+            } else {
+                print!("{}", crate::core::bm25_index::coverage::render(&coverage));
+            }
+            if coverage.exclusion.is_some() {
+                std::process::exit(1);
+            }
+        }
         _ => {
             eprintln!(
-                "Usage: lean-ctx index <status|build|build-full|build-graph|build-semantic|watch> [--root <path>]\n\
+                "Usage: lean-ctx index <status|build|build-full|build-graph|build-semantic|watch|why <file>> [--root <path>]\n\
                  Filter flags (#735, apply to this run; persist via [index] config):\n\
                    --exclude <glob>       drop matching files from the corpus (repeatable)\n\
                    --include <glob>       corpus = matching files only (repeatable)\n\
@@ -199,10 +217,32 @@ pub(crate) fn cmd_index(args: &[String]) {
                    lean-ctx index build-semantic --include \"**/*.{{java,kt,ts}}\"\n\
                    lean-ctx index build-graph        (SQLite property graph for impact analysis)\n\
                    lean-ctx index build-semantic     (dense embedding index, builds BM25 first if needed)\n\
-                   lean-ctx index watch"
+                   lean-ctx index watch\n\
+                   lean-ctx index why src/Legacy.cs  (is this file indexed? if not, which rule dropped it)"
             );
         }
     }
+}
+
+/// The first positional argument after the subcommand `sub`, skipping flags
+/// and the values of value-taking flags (see [`find_subcommand`]).
+fn positional_after<'a>(args: &'a [String], sub: &str) -> Option<&'a str> {
+    let mut seen_sub = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if INDEX_VALUE_FLAGS.contains(&a.as_str()) {
+            let _ = it.next();
+            continue;
+        }
+        if a.starts_with("--") {
+            continue;
+        }
+        if seen_sub {
+            return Some(a.as_str());
+        }
+        seen_sub = a == sub;
+    }
+    None
 }
 
 /// Wait for graph + BM25 with a shared progress indicator.
@@ -289,11 +329,13 @@ fn apply_semantic_progress(
 /// First non-flag token, skipping the values of value-taking flags — so
 /// `index build --exclude "**/*.csv"` resolves the subcommand `build`, not the
 /// glob (#735).
+/// Flags of `lean-ctx index` that consume the next argument.
+const INDEX_VALUE_FLAGS: [&str; 4] = ["--exclude", "--include", "--root", "--project-root"];
+
 fn find_subcommand(args: &[String]) -> Option<&str> {
-    const VALUE_FLAGS: [&str; 4] = ["--exclude", "--include", "--root", "--project-root"];
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if VALUE_FLAGS.contains(&a.as_str()) {
+        if INDEX_VALUE_FLAGS.contains(&a.as_str()) {
             let _ = it.next();
             continue;
         }
@@ -564,6 +606,20 @@ mod tests {
             find_subcommand(&args(&["--root", "/x", "--no-gitignore", "watch"])),
             Some("watch")
         );
+    }
+
+    #[test]
+    fn why_takes_the_file_after_the_subcommand() {
+        assert_eq!(
+            positional_after(&args(&["why", "src/a.cs"]), "why"),
+            Some("src/a.cs")
+        );
+        assert_eq!(
+            positional_after(&args(&["--root", "/x", "why", "--json", "b.rs"]), "why"),
+            Some("b.rs")
+        );
+        assert_eq!(positional_after(&args(&["why", "--json"]), "why"), None);
+        assert_eq!(find_subcommand(&args(&["why", "b.rs"])), Some("why"));
     }
 
     #[test]

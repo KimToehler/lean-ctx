@@ -198,6 +198,10 @@ fn looks_textual(path: &Path) -> bool {
     };
     let sample = &buf[..n];
 
+    // UTF-16 (Visual Studio, PowerShell `Out-File`) is text despite its NULs.
+    if crate::core::text_decode::has_utf16_bom(sample) {
+        return true;
+    }
     if sample.contains(&0) {
         return false;
     }

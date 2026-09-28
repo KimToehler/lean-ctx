@@ -236,7 +236,7 @@ class PythonEngineWheelTests(unittest.TestCase):
                 "thinkery-leanctx-engine-cuda",
                 "pypi-engine-cuda",
                 "thinkery_leanctx_engine_cuda",
-                1,
+                2,
             ),
             (
                 "thinkery-leanctx-engine-windows-gnu",
@@ -248,6 +248,7 @@ class PythonEngineWheelTests(unittest.TestCase):
         wheel_names = {
             "thinkery_leanctx_engine-3.10.1-py3-none-win_amd64.whl",
             "thinkery_leanctx_engine_cuda-3.10.1-py3-none-manylinux.whl",
+            "thinkery_leanctx_engine_cuda-3.10.1-py3-none-win_amd64.whl",
             "thinkery_leanctx_engine_windows_gnu-3.10.1-py3-none-win_amd64.whl",
         }
         for project, environment, prefix, expected_count in publishers:

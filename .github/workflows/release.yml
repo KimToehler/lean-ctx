@@ -342,7 +342,7 @@ jobs:
             dist-engine-wheels/*.whl
 
   build-windows:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.artifact || matrix.target }}
     needs: delivery-gate
     runs-on: windows-2025
     environment: windows-signing
@@ -362,6 +362,18 @@ jobs:
             zig: false
             artifact: ''
             cargo_features: ''
+            macos_deployment_target: ''
+          # Same MSVC engine with the CUDA execution provider compiled in; the
+          # CUDA/cuDNN DLLs stay a runtime dependency (`lean-ctx enable-gpu`).
+          - target: x86_64-pc-windows-msvc
+            artifact: x86_64-pc-windows-msvc-cuda
+            wheel_distribution: thinkery-leanctx-engine-cuda
+            wheel_platform: win_amd64
+            jemalloc: false
+            cross: false
+            musl: false
+            zig: false
+            cargo_features: ort-cuda
             macos_deployment_target: ''
           - target: x86_64-pc-windows-gnu
             wheel_distribution: thinkery-leanctx-engine-windows-gnu
@@ -395,7 +407,7 @@ jobs:
       - name: Collect companion wheels
         run: |
           find . -mindepth 2 -type f -name 'thinkery_leanctx_engine*.whl' -exec mv -t . {} +
-          test "$(find . -maxdepth 1 -type f -name 'thinkery_leanctx_engine*.whl' | wc -l)" -eq 9
+          test "$(find . -maxdepth 1 -type f -name 'thinkery_leanctx_engine*.whl' | wc -l)" -eq 10
 
       - name: Create stable source tarball
         run: |
@@ -673,7 +685,7 @@ jobs:
           - project: thinkery-leanctx-engine-cuda
             environment: pypi-engine-cuda
             wheel_prefix: thinkery_leanctx_engine_cuda
-            expected_wheels: 1
+            expected_wheels: 2
           - project: thinkery-leanctx-engine-windows-gnu
             environment: pypi-engine-windows-gnu
             wheel_prefix: thinkery_leanctx_engine_windows_gnu

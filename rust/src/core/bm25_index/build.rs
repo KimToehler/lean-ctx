@@ -45,7 +45,7 @@ fn effective_batch_size(max_files: usize) -> usize {
     )
 }
 
-const MAX_FILE_SIZE_BYTES: u64 = 2 * 1024 * 1024;
+pub(super) const MAX_FILE_SIZE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// A chunk with its lowercased index tokens precomputed off the hot merge path.
 struct PreparedChunk {
@@ -156,7 +156,7 @@ fn prepare_file(
         std::borrow::Cow::Owned(arc.to_string())
     } else {
         crate::core::cache::record_search_content_read(false);
-        match std::fs::read_to_string(&abs) {
+        match crate::core::text_decode::read_text(&abs) {
             Ok(c) => {
                 crate::core::content_cache::insert(
                     &abs,
@@ -399,7 +399,7 @@ impl BM25Index {
                 std::borrow::Cow::Owned(arc.to_string())
             } else {
                 crate::core::cache::record_search_content_read(false);
-                match std::fs::read_to_string(&abs) {
+                match crate::core::text_decode::read_text(&abs) {
                     Ok(c) => {
                         crate::core::content_cache::insert(
                             &abs,

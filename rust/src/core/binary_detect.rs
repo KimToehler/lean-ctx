@@ -149,7 +149,7 @@ fn has_binary_content(path: &str) -> bool {
     let Ok(n) = reader.read(&mut buf) else {
         return false;
     };
-    buf[..n].contains(&0)
+    crate::core::text_decode::looks_binary(&buf[..n])
 }
 
 /// Returns `true` if the file is likely a binary file.

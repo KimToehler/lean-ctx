@@ -490,7 +490,7 @@ fn snippet_from_disk(
     let Ok(path) = crate::core::pathjail::jail_path(&root.join(rel_path), root) else {
         return String::new();
     };
-    let Ok(content) = std::fs::read_to_string(path) else {
+    let Ok(content) = crate::core::text_decode::read_text(path) else {
         return String::new();
     };
     let lines: Vec<&str> = content.lines().collect();

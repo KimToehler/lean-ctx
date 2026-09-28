@@ -72,7 +72,7 @@ EVERYDAY COMMANDS:
 MANAGE:
     lean-ctx status                Am I connected? (quick check)
     lean-ctx update                Update to the latest version
-    lean-ctx enable-gpu            Install the CUDA-enabled Linux binary
+    lean-ctx enable-gpu            Install the CUDA-enabled binary (Linux, Windows)
     lean-ctx uninstall             Remove lean-ctx cleanly
 
 SAFETY (env vars):
@@ -165,7 +165,7 @@ COMMANDS:
          token-report [--json]          Token + memory report (project + session + CEP)
     pack --pr                      PR Context Pack (changed files, impact, tests, artifacts)
     snapshot create|list|show|verify|restore|publish|import  Context Time Machine: git-anchored, signed snapshots; replay, resume + share
-    index <status|build|build-full|watch> [--force]  Codebase index utilities
+    index <status|build|build-full|watch|why <file>>  Codebase index utilities
     embeddings status              Show the ONNX Runtime used for semantic embeddings (ORT_DYLIB_PATH)
     cep                            CEP report (compression metrics, cache, modes, trends)
     verify-cache [path] [--json]   Inspect local session-cache re-read behavior
@@ -236,7 +236,7 @@ COMMANDS:
     slow-log [list|clear]          Show/clear slow command log (~/.lean-ctx/slow-commands.log)
     debug-log [list|tail N|clear|path]  Opt-in tool-call + hook-routing log (set debug_log / LEAN_CTX_DEBUG_LOG)
     update [<version>] [--check]   Update lean-ctx, or pin a version, from GitHub Releases
-    enable-gpu [--check]           Install CUDA-enabled binary (x86_64 GNU/Linux)
+    enable-gpu [--check]           Install CUDA-enabled binary (x86_64 Linux/Windows)
     stop                           Stop ALL lean-ctx processes (daemon, proxy, orphans)
     restart                        Restart daemon (applies config.toml changes)
     dev-install                    Build release + atomic install + restart (for development)

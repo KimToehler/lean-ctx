@@ -158,6 +158,7 @@ lean-ctx index build             # build the search index
 lean-ctx index build-full        # full reindex
 lean-ctx index build-graph       # (re)build the property graph
 lean-ctx index watch             # keep it fresh on file changes
+lean-ctx index why <file>        # is this file indexed? if not, which rule dropped it
 ```
 
 **Golden output — `lean-ctx index status`** shows each index, its readiness,
@@ -175,6 +176,32 @@ graph are current:
 `Semantic: idle` means the optional embedding backend is not running — BM25 +
 graph still work. Index scanning can be disabled with `LEAN_CTX_NO_INDEX=1` /
 `LEAN_CTX_DISABLE_SEARCH_INDEX=1`, and bounded with `graph_index_max_files`.
+
+### Why is a file missing from search? — `lean-ctx index why <file>`
+
+`ctx_compose` / `ctx_search` answering "no match" for code that is on disk
+means the file is not in the corpus. `index why` replays the exact rules the
+indexer applies (gitignore, vendor/agent directories, ignore patterns, the
+`[index]` filter, file cap, size limit, binary/minified detection) and names
+the one that dropped the file, plus how to change it:
+
+```text
+$ lean-ctx index why web/app.min.js
+  File:      web/app.min.js
+  Kind:      code
+  Encoding:  utf-8
+  Corpus:    not indexed — matches ignore pattern `*.min.js`
+  Fix:       built-in patterns are fixed; for extra_ignore_patterns edit the config
+```
+
+An eligible file reports its encoding and BM25 state instead
+(`indexed, 12 chunks, up to date`, or `missing from the current index — run:
+lean-ctx index build`). Exit code: 0 eligible, 1 excluded. `--json` emits the
+structured result; MCP clients use `ctx_index action=why path=<file>`.
+
+Source files in legacy Windows encodings are indexed: UTF-16 (with BOM) and
+Windows-1252/"ANSI" files are decoded instead of skipped, and a UTF-8 BOM is
+stripped.
 
 ---
 

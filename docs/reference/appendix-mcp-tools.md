@@ -57,7 +57,7 @@ shows the smallest tool profile that exposes the tool (`M` minimal, `S` standard
 | `ctx_compress` | Context checkpoint for long conversations | `include_signatures` | S |
 | `ctx_compress_memory` | Compress memory/config files (CLAUDE.md, .cursorrules); backs up `.original.md` | `path`* | P |
 | `ctx_artifacts` | Context-artifact registry with BM25 search | list\|status\|index\|reindex\|search\|remove | P |
-| `ctx_index` | Build & manage the code index | status\|build\|build-full | P |
+| `ctx_index` | Build & manage the code index; explain why a file is not indexed | status\|build\|build-full\|why | P |
 
 ## 3. Session & multi-agent
 

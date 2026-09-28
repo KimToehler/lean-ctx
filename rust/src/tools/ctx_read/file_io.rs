@@ -70,17 +70,15 @@ fn read_open_file_lossy(file: std::fs::File, path: &str) -> Result<String, std::
     use std::io::{BufRead, Read};
     let mut bytes = Vec::with_capacity(meta.len() as usize);
     let mut reader = std::io::BufReader::new(file);
-    if reader.fill_buf()?.iter().take(8192).any(|byte| *byte == 0) {
+    if crate::core::text_decode::looks_binary(reader.fill_buf()?) {
         return Err(std::io::Error::other(
             crate::core::binary_detect::binary_file_message(path),
         ));
     }
     reader.read_to_end(&mut bytes)?;
-    let s = match String::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    };
-    Ok(crate::core::io_boundary::strip_utf8_bom(s))
+    // Same decoding as the index readers, so every file `ctx_compose` or
+    // `ctx_search` can return is readable here too (Windows ANSI, UTF-16).
+    Ok(crate::core::text_decode::decode(bytes))
 }
 
 #[cfg(unix)]

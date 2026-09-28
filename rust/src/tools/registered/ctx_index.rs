@@ -20,18 +20,23 @@ impl McpTool for CtxIndexTool {
             "Index orchestration — manage code graph index.\n\
              WORKFLOW: status → build → build-full (escalate if stale).\n\
              ANTI-PATTERN: build-full is expensive — use incremental build first.\n\
-             Actions: status (state), build (incremental), build-full (rebuild).",
+             Actions: status (state), build (incremental), build-full (rebuild),\n\
+             why (is `path` indexed? if not, the rule that dropped it).",
             json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "build", "build-full"],
-                        "description": "status|build|build-full"
+                        "enum": ["status", "build", "build-full", "why"],
+                        "description": "status|build|build-full|why"
                     },
                     "project_root": {
                         "type": "string",
                         "description": "Project root"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "File to diagnose (action=why)"
                     }
                 },
                 "required": ["action"]
@@ -59,6 +64,24 @@ impl McpTool for CtxIndexTool {
         } else {
             &ctx.project_root
         };
+
+        if action == "why" {
+            // The jail-resolved form when available; `explain` itself refuses
+            // anything outside `root` before reading content.
+            let file = if let Some(p) = ctx.resolved_path("path") {
+                p.to_string()
+            } else if let Some(err) = ctx.path_error("path") {
+                return Err(ErrorData::invalid_params(format!("path: {err}"), None));
+            } else {
+                get_str(args, "path").ok_or_else(|| {
+                    ErrorData::invalid_params("path is required for action=why", None)
+                })?
+            };
+            let coverage = crate::core::bm25_index::coverage::explain(Path::new(root), &file);
+            return Ok(ToolOutput::simple(
+                crate::core::bm25_index::coverage::render(&coverage),
+            ));
+        }
 
         let result = crate::tools::ctx_index::handle(&action, Path::new(root));
 

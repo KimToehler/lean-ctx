@@ -7,6 +7,7 @@ mod build;
 mod chunking;
 pub use chunking::*;
 mod coordinator;
+pub(crate) mod coverage;
 pub use coordinator::{SearchIndexBuildProgress, get_or_start_build};
 #[cfg(test)]
 mod tests;
@@ -474,7 +475,7 @@ impl BM25Index {
                     Err(_) => continue,
                 }
             } else {
-                match std::fs::read_to_string(&abs) {
+                match crate::core::text_decode::read_text(&abs) {
                     Ok(c) => c,
                     Err(_) => continue,
                 }
@@ -1073,44 +1074,88 @@ fn index_dir(root: &Path) -> PathBuf {
     crate::core::index_namespace::vectors_dir(root)
 }
 
-fn list_code_files(root: &Path) -> Vec<String> {
-    let cfg = crate::core::config::Config::load();
-    // #735: the declared corpus filter ([index] config + CLI overlay) decides
-    // membership before anything is chunked; the semantic index chunks this
-    // corpus, so it inherits the same universe.
-    let filter = crate::core::index_filter::IndexFileFilter::resolve(&cfg);
+/// Walk depth of the corpus walk. Deeper files are never indexed.
+const CORPUS_MAX_DEPTH: usize = 20;
 
-    let walker = ignore::WalkBuilder::new(root)
-        // #1792: the BM25 corpus is authoritative for `ctx_compose`/`ctx_overview`,
-        // so omitting tracked dotfiles made "no match" indistinguishable from
-        // "not indexed".
-        .hidden(crate::core::walk_filter::SKIP_HIDDEN_IN_CONTENT_WALK)
-        .git_ignore(filter.respect_gitignore)
-        .git_global(filter.respect_gitignore)
-        .git_exclude(filter.respect_gitignore)
-        .require_git(false)
-        .max_depth(Some(20))
+/// The rules that decide corpus membership, loaded once. Shared by
+/// [`list_code_files`] and the `index why` diagnostic ([`coverage`]), so the
+/// explanation can never drift from what the indexer actually does.
+pub(crate) struct CorpusRules {
+    filter: crate::core::index_filter::IndexFileFilter,
+    /// `DEFAULT_BM25_IGNORES` followed by `extra_ignore_patterns`, with the
+    /// source text kept so a diagnostic can name the pattern that matched.
+    ignore_patterns: Vec<(String, glob::Pattern)>,
+    max_files: usize,
+}
+
+impl CorpusRules {
+    pub(crate) fn load() -> Self {
+        let cfg = crate::core::config::Config::load();
+        // #735: the declared corpus filter ([index] config + CLI overlay) decides
+        // membership before anything is chunked; the semantic index chunks this
+        // corpus, so it inherits the same universe.
+        let filter = crate::core::index_filter::IndexFileFilter::resolve(&cfg);
+        let ignore_patterns = DEFAULT_BM25_IGNORES
+            .iter()
+            .map(|p| (*p).to_string())
+            .chain(cfg.extra_ignore_patterns.iter().cloned())
+            .filter_map(|p| glob::Pattern::new(&p).ok().map(|g| (p, g)))
+            .collect();
+        // Mirrors graph_index_max_files: 0 = unlimited, default 5000 (MAX_BM25_FILES).
+        let max_files = if cfg.bm25_max_files == 0 {
+            usize::MAX
+        } else {
+            cfg.bm25_max_files as usize
+        };
+        Self {
+            filter,
+            ignore_patterns,
+            max_files,
+        }
+    }
+
+    /// The corpus walker: gitignore per the filter, bounded depth. Callers add
+    /// their own `filter_entry`.
+    fn walker(&self, root: &Path) -> ignore::WalkBuilder {
+        let mut builder = ignore::WalkBuilder::new(root);
+        builder
+            // #1792: the BM25 corpus is authoritative for `ctx_compose`/`ctx_overview`,
+            // so omitting tracked dotfiles made "no match" indistinguishable from
+            // "not indexed".
+            .hidden(crate::core::walk_filter::SKIP_HIDDEN_IN_CONTENT_WALK)
+            .git_ignore(self.filter.respect_gitignore)
+            .git_global(self.filter.respect_gitignore)
+            .git_exclude(self.filter.respect_gitignore)
+            .require_git(false)
+            .max_depth(Some(CORPUS_MAX_DEPTH));
+        builder
+    }
+
+    /// First default/extra ignore pattern matching `rel`.
+    fn ignore_pattern_for(&self, rel: &str) -> Option<&str> {
+        self.ignore_patterns
+            .iter()
+            .find(|(_, p)| p.matches(rel))
+            .map(|(src, _)| src.as_str())
+    }
+
+    /// Whether the declared `[index]` filter drops `rel`. Globs match on
+    /// forward slashes so they behave identically on Windows; the index key
+    /// keeps the platform separator (existing indexes stay valid).
+    fn filter_excludes(&self, rel: &str) -> bool {
+        self.filter.is_excluded(&rel.replace('\\', "/"))
+    }
+}
+
+fn list_code_files(root: &Path) -> Vec<String> {
+    let rules = CorpusRules::load();
+    let walker = rules
+        .walker(root)
         .filter_entry(crate::core::walk_filter::keep_entry)
         .build();
 
-    let mut ignore_patterns: Vec<glob::Pattern> = DEFAULT_BM25_IGNORES
-        .iter()
-        .filter_map(|p| glob::Pattern::new(p).ok())
-        .collect();
-    ignore_patterns.extend(
-        cfg.extra_ignore_patterns
-            .iter()
-            .filter_map(|p| glob::Pattern::new(p).ok()),
-    );
-
     let mut files: Vec<String> = Vec::new();
     let mut filtered_out = 0usize;
-    // Mirrors graph_index_max_files: 0 = unlimited, default 5000 (MAX_BM25_FILES).
-    let max_files = if cfg.bm25_max_files == 0 {
-        usize::MAX
-    } else {
-        cfg.bm25_max_files as usize
-    };
     for entry in walker.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -1127,20 +1172,18 @@ fn list_code_files(root: &Path) -> Vec<String> {
         if rel.is_empty() {
             continue;
         }
-        if ignore_patterns.iter().any(|p| p.matches(&rel)) {
+        if rules.ignore_pattern_for(&rel).is_some() {
             continue;
         }
-        // Match on forward slashes so globs behave identically on Windows;
-        // the index key keeps the platform separator (existing indexes stay
-        // valid).
-        if filter.is_excluded(&rel.replace('\\', "/")) {
+        if rules.filter_excludes(&rel) {
             filtered_out += 1;
             continue;
         }
-        if files.len() >= max_files {
+        if files.len() >= rules.max_files {
             tracing::warn!(
-                "[bm25] file cap reached ({max_files}), skipping remaining files in {}. \
+                "[bm25] file cap reached ({}), skipping remaining files in {}. \
                  Set bm25_max_files in config (0 = unlimited) to index more.",
+                rules.max_files,
                 root.display()
             );
             break;
@@ -1151,7 +1194,7 @@ fn list_code_files(root: &Path) -> Vec<String> {
     if filtered_out > 0 {
         tracing::info!(
             "[bm25] index filter excluded {filtered_out} files ({})",
-            filter.summary().unwrap_or_default()
+            rules.filter.summary().unwrap_or_default()
         );
     }
 

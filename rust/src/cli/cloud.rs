@@ -168,22 +168,10 @@ pub fn cmd_sync(rest: &[String]) {
         std::process::exit(1);
     }
 
-    // Stats roll-up is account-level and stays free for everyone.
-    println!("Syncing stats...");
+    // Every sync surface, stats included, is the Pro "Personal Cloud". On a Free
+    // account the server returns 402; detect it once and show a friendly upgrade
+    // hint instead of one failure per surface.
     let store = core::stats::load();
-    let entries = build_sync_entries(&store);
-    if entries.is_empty() {
-        println!("No stats to sync yet.");
-    } else {
-        match cloud_client::sync_stats(&entries) {
-            Ok(_) => println!("  Stats: synced"),
-            Err(e) => tracing::error!("Stats sync failed: {e}"),
-        }
-    }
-
-    // Everything below is the Pro "Personal Cloud" (cross-device sync of your own
-    // context). On a Free account the server returns 402; detect it once and show
-    // a friendly upgrade hint instead of one failure per surface.
     if sync_personal_cloud(&store) == CloudSyncOutcome::Gated {
         print_pro_upgrade_hint();
         return;
@@ -312,6 +300,18 @@ enum CloudSyncOutcome {
 /// rather than one error per surface. A self-hosted backend with the gate open
 /// (billing unset / `LEANCTX_CLOUD_SYNC_OPEN`) never returns 402, so all sync.
 fn sync_personal_cloud(store: &core::stats::StatsStore) -> CloudSyncOutcome {
+    println!("Syncing stats...");
+    let entries = build_sync_entries(store);
+    if entries.is_empty() {
+        println!("  No stats to sync yet.");
+    } else {
+        match cloud_client::sync_stats(&entries) {
+            Ok(_) => println!("  Stats: synced"),
+            Err(e) if pro_gate_hit(&e) => return CloudSyncOutcome::Gated,
+            Err(e) => tracing::error!("Stats sync failed: {e}"),
+        }
+    }
+
     println!("Syncing commands...");
     let command_entries = collect_command_entries(store);
     if command_entries.is_empty() {

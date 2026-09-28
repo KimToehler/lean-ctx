@@ -141,7 +141,7 @@ or the single dir for legacy/mixed installs — see §1); per-project override a
 |---------|------------------|
 | (root keys) | compression, cache, shell hook, profiles, memory caps, savings footer, proxy tri-state |
 | `[tools]` | `profile` (minimal/standard/power), explicit `enabled` list |
-| `[setup]` | `auto_inject_rules`, `auto_inject_skills`, `auto_update_mcp` |
+| `[setup]` | `auto_inject_rules`, `auto_inject_skills`, `auto_update_mcp`, `manage_hooks` |
 | `[archive]` | Zero-loss tool-output archive: `enabled`, `threshold_chars` (800), `max_age_hours` (48), `max_disk_mb` (500) |
 | `[search]` | BM25/dense/splade weights + candidate counts |
 | `[autonomy]` | Auto preload/dedup/consolidate, cognition loop |

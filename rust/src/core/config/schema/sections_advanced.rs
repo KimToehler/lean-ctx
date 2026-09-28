@@ -615,6 +615,14 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
             "Register lean-ctx MCP server in editor configs during setup/update",
         ),
     );
+    setup_keys.insert(
+        "manage_hooks".into(),
+        key(
+            "bool",
+            serde_json::json!(true),
+            "Refresh already-installed agent hooks, permissions.deny and status line on MCP server start. false = only explicit setup/init/doctor --fix writes them",
+        ),
+    );
     sections.insert(
             "setup".into(),
             SectionSchema {

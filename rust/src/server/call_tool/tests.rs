@@ -579,6 +579,18 @@ mod shell_outcome_tests {
         );
     }
 
+    /// #1881: a signal-terminated command with output used to surface as
+    /// Exit(1) and pass the grep-style exception as a success. As 128+signal
+    /// it is an error regardless of output.
+    #[test]
+    fn signal_termination_with_output_is_error() {
+        let r = finalize_call_result(
+            "partial output\n[exit:143 — SIGTERM]",
+            Some(ShellOutcome::Exit(143)),
+        );
+        assert_eq!(r.is_error, Some(true));
+    }
+
     /// MES-1609: once a foreground command auto-detaches, its terminal
     /// failure is a job verdict, not grep-like output that may use exit 1 as
     /// data. The MCP result must therefore keep both state and exit code.

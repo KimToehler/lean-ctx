@@ -235,11 +235,7 @@ impl McpTool for CtxShellTool {
                     let output = redact_shell_output_secrets(&raw_output);
                     // Keep failure reporting consistent on this degraded path:
                     // same [exit:N] footer and the same structured outcome (#389).
-                    let exit_suffix = match exit_code {
-                        0 => String::new(),
-                        124 => "\n[exit:124 — command timed out]".to_string(),
-                        _ => format!("\n[exit:{exit_code}]"),
-                    };
+                    let exit_suffix = crate::shell::exit_status::exit_footer(exit_code);
                     return Ok(ToolOutput {
                         shell_outcome: Some(ShellOutcome::Exit(exit_code)),
                         content_blocks: None,
@@ -521,11 +517,7 @@ impl McpTool for CtxShellTool {
             // #815: exit 124 = timeout signal (from timeout(1) / lean-ctx
             // shell timeout). Make it explicit so agents don't confuse a
             // timed-out command with a successful empty result.
-            let exit_suffix = match exit_code {
-                0 => String::new(),
-                124 => "\n[exit:124 — command timed out]".to_string(),
-                _ => format!("\n[exit:{exit_code}]"),
-            };
+            let exit_suffix = crate::shell::exit_status::exit_footer(exit_code);
             let nudge = if raw { "" } else { search_tool_nudge(&command) };
             let final_out = format!(
                 "{result_out}{tee_hint}{shell_mismatch}{cwd_jail_hint}{nudge}{exit_suffix}"
@@ -1202,11 +1194,7 @@ fn handle_interpreter_heredoc_reroute(
         crate::tools::ctx_shell::handle(&rest_cmd, &shell_output, shell_exit, ctx.crp_mode)
     };
     let shell_text = crate::core::redaction::redact_text_if_enabled(&shell_text);
-    let exit_suffix = match shell_exit {
-        0 => String::new(),
-        124 => "\n[exit:124 — command timed out]".to_string(),
-        _ => format!("\n[exit:{shell_exit}]"),
-    };
+    let exit_suffix = crate::shell::exit_status::exit_footer(shell_exit);
 
     let combined = format!(
         "{exec_text}{reroute_note}\n\n[heredoc remainder via ctx_shell]\n{shell_text}{exit_suffix}"

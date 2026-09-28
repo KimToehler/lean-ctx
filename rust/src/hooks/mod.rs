@@ -246,7 +246,15 @@ const REFRESH_EXEMPT_HYBRID_AGENTS: &[&str] = &[
 /// Called after updates and on MCP server start to ensure hooks match the
 /// current binary version. Registry-driven: every Hybrid agent with a global
 /// shell hook is covered (the rest are explicitly exempted, enforced by test).
+///
+/// `[setup] manage_hooks = false` turns this into a no-op (#1879): users who
+/// hand-pick hook entries keep them, and only an explicit `setup`, `init` or
+/// `doctor --fix` writes agent hook config.
 pub fn refresh_installed_hooks() {
+    if !crate::core::config::Config::load().setup.manage_hooks {
+        tracing::debug!("hook refresh skipped: [setup] manage_hooks = false");
+        return;
+    }
     let Some(home) = crate::core::home::resolve_home_dir() else {
         return;
     };

@@ -262,6 +262,12 @@ pub struct SetupConfig {
     /// Register lean-ctx as an MCP server in editor configs.
     #[serde(default = "serde_defaults::default_true")]
     pub auto_update_mcp: bool,
+    /// Keep already-installed agent hooks current on MCP server start (#1879).
+    /// `false` leaves hook entries, `permissions.deny` and the status line in
+    /// agent settings exactly as the user wrote them; only an explicit
+    /// `lean-ctx setup` / `init --agent` / `doctor --fix` writes them.
+    #[serde(default = "serde_defaults::default_true")]
+    pub manage_hooks: bool,
 }
 
 impl Default for SetupConfig {
@@ -270,6 +276,7 @@ impl Default for SetupConfig {
             auto_inject_rules: None,
             auto_inject_skills: None,
             auto_update_mcp: true,
+            manage_hooks: true,
         }
     }
 }

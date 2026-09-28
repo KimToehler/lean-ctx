@@ -92,7 +92,7 @@ fn exec_direct(args: &[String]) -> i32 {
     let status = cmd.status();
 
     match status {
-        Ok(s) => s.code().unwrap_or(1),
+        Ok(s) => crate::shell::exit_status::exit_code(s),
         Err(e) => {
             tracing::error!("lean-ctx: failed to execute: {e}");
             127
@@ -494,7 +494,7 @@ fn sandbox_launcher_gated_command(argv: &[String]) -> String {
 /// runaway nesting.
 fn exec_sandbox_launcher(argv: &[String]) -> i32 {
     match sandbox_launcher_command(argv).status() {
-        Ok(s) => s.code().unwrap_or(1),
+        Ok(s) => crate::shell::exit_status::exit_code(s),
         Err(e) => {
             tracing::error!("lean-ctx: failed to execute sandbox launcher: {e}");
             127
@@ -530,7 +530,7 @@ fn exec_inherit(command: &str, shell: &str, shell_flag: &str) -> i32 {
     let status = cmd.status();
 
     match status {
-        Ok(s) => s.code().unwrap_or(1),
+        Ok(s) => crate::shell::exit_status::exit_code(s),
         Err(e) => {
             tracing::error!("lean-ctx: failed to execute: {e}");
             127
@@ -553,7 +553,7 @@ fn exec_shell_default(command: &str, shell: &str, shell_flag: &str) -> i32 {
     let status = cmd.status();
 
     match status {
-        Ok(s) => s.code().unwrap_or(1),
+        Ok(s) => crate::shell::exit_status::exit_code(s),
         Err(e) => {
             eprintln!("lean-ctx: failed to execute '{command}': {e}");
             127

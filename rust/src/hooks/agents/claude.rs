@@ -599,8 +599,13 @@ fn is_lean_ctx_command_for(hook: &serde_json::Value, action: &str) -> bool {
     if !cmd.contains("lean-ctx") {
         return false;
     }
-    if cmd.trim_end().ends_with(action) {
-        return true;
+    // Only `<lean-ctx binary> hook <action>` is ours. A user wrapper that merely *mentions*
+    // lean-ctx (`redact-wrap lean-ctx hook rewrite`) ends with the same action but must never
+    // be stripped (#1879).
+    if let Some(program) = cmd.trim_end().strip_suffix(action) {
+        if let Some(program) = program.strip_suffix(' ') {
+            return is_lean_ctx_program(program);
+        }
     }
     let legacy = if action.ends_with("rewrite") {
         "lean-ctx-rewrite"
@@ -610,6 +615,107 @@ fn is_lean_ctx_command_for(hook: &serde_json::Value, action: &str) -> bool {
         return false;
     };
     cmd.contains(legacy)
+}
+
+/// True if `program` (the part of a hook command before ` hook <action>`) is the lean-ctx
+/// binary: a bare `lean-ctx`, any path to it (quoted or not, with spaces, `.exe`, `$HOME/…`
+/// portable forms), the configured `hook_binary` override verbatim, or the binary path the
+/// installer currently renders (covers renamed binaries, which would otherwise be re-added on
+/// every refresh).
+fn is_lean_ctx_program(program: &str) -> bool {
+    let program = program.trim().trim_matches(|c| c == '"' || c == '\'');
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    name.eq_ignore_ascii_case("lean-ctx")
+        || name.eq_ignore_ascii_case("lean-ctx.exe")
+        || crate::core::portable_binary::hook_binary_override().is_some_and(|o| o == program)
+        || crate::hooks::resolve_binary_path() == program
+}
+
+/// Remove every lean-ctx hook for `action` (any path, any matcher group), dropping groups
+/// left empty. Non-lean-ctx hooks are untouched.
+fn strip_lean_ctx_hooks(pre_arr: &mut Vec<serde_json::Value>, action: &str) {
+    for group in pre_arr.iter_mut() {
+        if let Some(hooks) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+            hooks.retain(|h| !is_lean_ctx_command_for(h, action));
+        }
+    }
+    pre_arr.retain(|g| {
+        g.get("hooks")
+            .and_then(|h| h.as_array())
+            .is_none_or(|hooks| !hooks.is_empty())
+    });
+}
+
+/// True if a Claude Code `matcher` applies to the `Bash` tool: absent/empty, `*`, or a regex
+/// that matches `Bash` exactly (Claude anchors matchers against the tool name).
+fn matcher_covers_bash(matcher: Option<&str>) -> bool {
+    match matcher.map(str::trim) {
+        None | Some("" | "*") => true,
+        Some(m) => regex::Regex::new(&format!("^(?:{m})$")).is_ok_and(|re| re.is_match("Bash")),
+    }
+}
+
+/// Upper bound for a hook script we inspect for delegation; real wrappers are a few KiB.
+const DELEGATION_SCRIPT_MAX_BYTES: u64 = 256 * 1024;
+
+fn calls_lean_ctx_rewrite(text: &str) -> bool {
+    text.contains("lean-ctx") && text.contains("hook rewrite")
+}
+
+/// Resolve a command token that names a script file: absolute, `~/…`, `$HOME/…`, `${HOME}/…`.
+fn script_path_from_token(token: &str, home: &std::path::Path) -> Option<std::path::PathBuf> {
+    let token = token.trim_matches(|c| c == '"' || c == '\'');
+    for prefix in ["~/", "$HOME/", "${HOME}/"] {
+        if let Some(rest) = token.strip_prefix(prefix) {
+            return home.is_absolute().then(|| home.join(rest));
+        }
+    }
+    let path = std::path::Path::new(token);
+    path.is_absolute().then(|| path.to_path_buf())
+}
+
+/// #1879: true when a user-owned PreToolUse hook covering Bash already calls
+/// `lean-ctx hook rewrite` itself — inline, or from a script it runs — typically a wrapper that
+/// post-processes the rewrite (secret redaction, EXIT traps). Adding lean-ctx's own parallel
+/// rewrite hook next to it would make two hooks return `updatedInput` for the same call and
+/// silently drop the wrapper whenever lean-ctx's result wins.
+fn bash_rewrite_is_delegated(pre_arr: &[serde_json::Value], home: &std::path::Path) -> bool {
+    pre_arr
+        .iter()
+        .filter(|g| matcher_covers_bash(g.get("matcher").and_then(|m| m.as_str())))
+        .filter_map(|g| g.get("hooks").and_then(|h| h.as_array()))
+        .flatten()
+        .filter(|h| h.get("type").and_then(|t| t.as_str()) == Some("command"))
+        .filter(|h| !is_lean_ctx_command_for(h, "hook rewrite"))
+        .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
+        .any(|cmd| {
+            calls_lean_ctx_rewrite(cmd)
+                || cmd
+                    .split_whitespace()
+                    .filter_map(|t| script_path_from_token(t, home))
+                    .any(|p| {
+                        std::fs::metadata(&p)
+                            .is_ok_and(|m| m.is_file() && m.len() <= DELEGATION_SCRIPT_MAX_BYTES)
+                            && std::fs::read_to_string(&p).is_ok_and(|s| calls_lean_ctx_rewrite(&s))
+                    })
+        })
+}
+
+/// Install lean-ctx's Bash rewrite hook unless the user delegates it through their own hook
+/// ([`bash_rewrite_is_delegated`]); in that case any parallel lean-ctx rewrite entry is removed
+/// so exactly one hook rewrites each command.
+fn ensure_bash_rewrite_hook(
+    pre_arr: &mut Vec<serde_json::Value>,
+    matcher: &str,
+    command: &str,
+    home: &std::path::Path,
+) {
+    if bash_rewrite_is_delegated(pre_arr, home) {
+        strip_lean_ctx_hooks(pre_arr, lean_ctx_action_token(command));
+        tracing::info!("Bash rewrite delegated to a user hook; not adding lean-ctx's own (#1879)");
+        return;
+    }
+    ensure_command_hook(pre_arr, matcher, command);
 }
 
 /// Ensure exactly one lean-ctx hook for `command`'s action exists under `matcher`.
@@ -622,18 +728,7 @@ fn is_lean_ctx_command_for(hook: &serde_json::Value, action: &str) -> bool {
 /// single fresh one. This is idempotent across re-runs *and* self-heals settings files already
 /// duplicated by older versions, while leaving any non-lean-ctx hooks untouched.
 fn ensure_command_hook(pre_arr: &mut Vec<serde_json::Value>, matcher: &str, command: &str) {
-    let action = lean_ctx_action_token(command);
-
-    for group in pre_arr.iter_mut() {
-        if let Some(hooks) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
-            hooks.retain(|h| !is_lean_ctx_command_for(h, action));
-        }
-    }
-    pre_arr.retain(|g| {
-        g.get("hooks")
-            .and_then(|h| h.as_array())
-            .is_none_or(|hooks| !hooks.is_empty())
-    });
+    strip_lean_ctx_hooks(pre_arr, lean_ctx_action_token(command));
 
     let desired = serde_json::json!({ "type": "command", "command": command });
     if let Some(group) = pre_arr
@@ -769,7 +864,7 @@ pub(crate) fn install_claude_hook_config(home: &std::path::Path) {
                     .entry("PreToolUse".to_string())
                     .or_insert_with(|| serde_json::json!([]));
                 if let Some(pre_arr) = pre.as_array_mut() {
-                    ensure_command_hook(pre_arr, bash_matcher, &rewrite_cmd);
+                    ensure_bash_rewrite_hook(pre_arr, bash_matcher, &rewrite_cmd, home);
                     ensure_command_hook(pre_arr, REDIRECT_MATCHER, &redirect_cmd);
                 }
                 ensure_claude_observe_hooks(hooks_obj, &observe_cmd);
@@ -843,7 +938,10 @@ pub(crate) fn install_claude_project_hooks(cwd: &std::path::Path) {
                     .entry("PreToolUse".to_string())
                     .or_insert_with(|| serde_json::json!([]));
                 if let Some(pre_arr) = pre.as_array_mut() {
-                    ensure_command_hook(pre_arr, bash_matcher, &rewrite_cmd);
+                    // Project wrappers reference `~/…` scripts too; without a resolvable home
+                    // only inline delegation is detected.
+                    let home = crate::core::home::resolve_home_dir().unwrap_or_default();
+                    ensure_bash_rewrite_hook(pre_arr, bash_matcher, &rewrite_cmd, &home);
                     ensure_command_hook(pre_arr, REDIRECT_MATCHER, &redirect_cmd);
                 }
                 ensure_claude_project_observe_hooks(hooks_obj, &observe_cmd);
@@ -1023,6 +1121,144 @@ mod tests {
         assert_eq!(
             commands_for(&pre, "hook redirect"),
             ["lean-ctx hook redirect"]
+        );
+    }
+
+    fn all_commands(pre: &[serde_json::Value]) -> Vec<String> {
+        pre.iter()
+            .filter_map(|g| g.get("hooks").and_then(|h| h.as_array()))
+            .flatten()
+            .filter_map(|h| h.get("command").and_then(|c| c.as_str()).map(String::from))
+            .collect()
+    }
+
+    fn cmd_hook(command: &str) -> serde_json::Value {
+        json!({ "type": "command", "command": command })
+    }
+
+    #[test]
+    fn own_hook_recognised_in_every_rendering() {
+        for cmd in [
+            "lean-ctx hook rewrite",
+            "/Users/x/.local/bin/lean-ctx hook rewrite",
+            "\"/Users/First Last/bin/lean-ctx\" hook rewrite",
+            "C:\\Program Files\\lean-ctx\\lean-ctx.exe hook rewrite",
+            "$HOME/.cargo/bin/lean-ctx hook rewrite",
+            "/home/u/.claude/hooks/lean-ctx-rewrite.sh",
+        ] {
+            assert!(
+                is_lean_ctx_command_for(&cmd_hook(cmd), "hook rewrite"),
+                "not recognised as own: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_wrapper_mentioning_lean_ctx_is_not_own() {
+        // #1879: a wrapper that ends in the same action is the user's, not ours.
+        for cmd in [
+            "redact-wrap lean-ctx hook rewrite",
+            "sh -c 'lean-ctx hook rewrite'",
+            "/opt/bin/not-lean-ctx hook rewrite",
+        ] {
+            assert!(
+                !is_lean_ctx_command_for(&cmd_hook(cmd), "hook rewrite"),
+                "user wrapper treated as own: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_wrapper_survives_install() {
+        let mut pre = vec![json!({
+            "matcher": "Bash",
+            "hooks": [cmd_hook("redact-wrap lean-ctx hook rewrite")]
+        })];
+        ensure_command_hook(&mut pre, BASH, "lean-ctx hook rewrite");
+        assert!(
+            all_commands(&pre)
+                .iter()
+                .any(|c| c == "redact-wrap lean-ctx hook rewrite"),
+            "user wrapper stripped: {pre:?}"
+        );
+    }
+
+    #[test]
+    fn matcher_coverage_of_bash() {
+        for m in [
+            None,
+            Some(""),
+            Some("*"),
+            Some("Bash"),
+            Some("Bash|bash"),
+            Some(".*"),
+        ] {
+            assert!(matcher_covers_bash(m), "{m:?} should cover Bash");
+        }
+        for m in [
+            Some("Read"),
+            Some("Grep|Glob"),
+            Some("BashOutput"),
+            Some("("),
+        ] {
+            assert!(!matcher_covers_bash(m), "{m:?} must not cover Bash");
+        }
+    }
+
+    #[test]
+    fn inline_delegation_prevents_parallel_rewrite_hook() {
+        let home = tempfile::tempdir().unwrap();
+        let mut pre = vec![
+            json!({ "matcher": "Bash", "hooks": [cmd_hook("redact-wrap lean-ctx hook rewrite")] }),
+            // A stale parallel entry from an earlier refresh must be removed, not kept.
+            json!({ "matcher": BASH, "hooks": [cmd_hook("/abs/lean-ctx hook rewrite")] }),
+        ];
+        for _ in 0..3 {
+            ensure_bash_rewrite_hook(&mut pre, BASH, "lean-ctx hook rewrite", home.path());
+        }
+        assert!(commands_for(&pre, "hook rewrite").is_empty(), "{pre:?}");
+        assert_eq!(all_commands(&pre), ["redact-wrap lean-ctx hook rewrite"]);
+    }
+
+    #[test]
+    fn script_delegation_prevents_parallel_rewrite_hook() {
+        let home = tempfile::tempdir().unwrap();
+        let script = home.path().join("bin/redact-bash.sh");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ntrap cleanup EXIT\nout=$(lean-ctx hook rewrite)\nredact \"$out\"\n",
+        )
+        .unwrap();
+        for command in [
+            "~/bin/redact-bash.sh".to_string(),
+            "bash \"$HOME/bin/redact-bash.sh\"".to_string(),
+            script.display().to_string(),
+        ] {
+            let mut pre = vec![json!({ "matcher": "Bash", "hooks": [cmd_hook(&command)] })];
+            ensure_bash_rewrite_hook(&mut pre, BASH, "lean-ctx hook rewrite", home.path());
+            assert_eq!(
+                all_commands(&pre),
+                std::slice::from_ref(&command),
+                "via {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_bash_hook_still_gets_rewrite() {
+        let home = tempfile::tempdir().unwrap();
+        let script = home.path().join("audit.sh");
+        std::fs::write(&script, "#!/bin/sh\nlogger \"$1\"\n").unwrap();
+        let mut pre = vec![
+            json!({ "matcher": "Bash", "hooks": [cmd_hook(&script.display().to_string())] }),
+            // Mentions the rewrite, but only for Read — not a Bash delegation.
+            json!({ "matcher": "Read", "hooks": [cmd_hook("wrap lean-ctx hook rewrite")] }),
+        ];
+        ensure_bash_rewrite_hook(&mut pre, BASH, "lean-ctx hook rewrite", home.path());
+        assert_eq!(
+            commands_for(&pre, "hook rewrite"),
+            ["lean-ctx hook rewrite"]
         );
     }
 

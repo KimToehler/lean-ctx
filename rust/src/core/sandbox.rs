@@ -488,7 +488,7 @@ fn execute_with_stdin(
     Ok((
         crate::shell::decode_output(&output.stdout),
         crate::shell::decode_output(&output.stderr),
-        output.status.code().unwrap_or(1),
+        crate::shell::exit_status::exit_code(output.status),
     ))
 }
 
@@ -534,7 +534,7 @@ fn execute_with_file(
         Ok((
             crate::shell::decode_output(&output.stdout),
             crate::shell::decode_output(&output.stderr),
-            output.status.code().unwrap_or(1),
+            crate::shell::exit_status::exit_code(output.status),
         ))
     };
 
@@ -566,7 +566,11 @@ fn execute_rust(
     if !compile.status.success() {
         let stderr = crate::shell::decode_output(&compile.stderr);
         let _ = std::fs::remove_file(&binary_path);
-        return Ok((String::new(), stderr, compile.status.code().unwrap_or(1)));
+        return Ok((
+            String::new(),
+            stderr,
+            crate::shell::exit_status::exit_code(compile.status),
+        ));
     }
 
     let mut run_cmd = Command::new(&binary_path);
@@ -594,7 +598,7 @@ fn execute_rust(
     Ok((
         crate::shell::decode_output(&output.stdout),
         crate::shell::decode_output(&output.stderr),
-        output.status.code().unwrap_or(1),
+        crate::shell::exit_status::exit_code(output.status),
     ))
 }
 

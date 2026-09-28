@@ -464,6 +464,7 @@ Controls what lean-ctx injects during setup and updates. Fresh installs default 
 - `auto_inject_rules` (bool?, default `null`) — Inject agent rule files during setup/update. null=auto (inject if already present), true=always, false=never
 - `auto_inject_skills` (bool?, default `null`) — Install SKILL.md files during setup/update. null=auto (install if rules present), true=always, false=never
 - `auto_update_mcp` (bool, default `true`) — Register lean-ctx MCP server in editor configs during setup/update
+- `manage_hooks` (bool, default `true`) — Refresh already-installed agent hooks, permissions.deny and status line on MCP server start. false = only explicit setup/init/doctor --fix writes them
 
 ## `[skillify]`
 

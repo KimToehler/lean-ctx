@@ -258,7 +258,7 @@ pub(crate) fn execute_command_with_env_cancellable(
     let mut still_running: Vec<String> = Vec::new();
     let (code, timed_out, cancelled) = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break (status.code().unwrap_or(1), false, false),
+            Ok(Some(status)) => break (crate::shell::exit_status::exit_code(status), false, false),
             Ok(None) => {
                 if cancel.is_some_and(|signal| signal.load(std::sync::atomic::Ordering::Acquire)) {
                     kill_timed_out_child(&mut child);
@@ -920,6 +920,19 @@ mod tests {
             output.contains("12345"),
             "child process should receive EOF on stdin, got: {output}"
         );
+    }
+
+    /// #1881: a command terminated by a signal reports `128 + signal`, not 1.
+    /// Exit 1 plus output would even pass as a grep-style success (#1090).
+    #[test]
+    #[cfg(unix)]
+    fn execute_command_reports_signal_termination_as_128_plus_signal() {
+        let (output, code) = execute_command_in("echo before-kill; kill -TERM $$", ".");
+        assert_eq!(code, 143, "SIGTERM must map to 143, got {code}: {output}");
+        assert!(output.contains("before-kill"), "output kept: {output}");
+
+        let (_, code) = execute_command_in("kill -KILL $$", ".");
+        assert_eq!(code, 137, "SIGKILL must map to 137");
     }
 
     /// #945: a command that finishes but leaves a process holding the stdout

@@ -144,7 +144,8 @@ fn detect_single_byte_or_utf8(bytes: &[u8]) -> Encoding {
 
 fn decode_utf16(body: &[u8], unit: fn([u8; 2]) -> u16) -> String {
     // A dangling odd byte cannot form a code unit; drop it rather than fail.
-    let units = body.chunks_exact(2).map(|pair| unit([pair[0], pair[1]]));
+    let (pairs, _) = body.as_chunks::<2>();
+    let units = pairs.iter().map(|&pair| unit(pair));
     char::decode_utf16(units)
         .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
         .collect()

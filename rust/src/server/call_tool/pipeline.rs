@@ -1096,9 +1096,15 @@ pub(in crate::server) async fn dispatch_and_post_process(
     // original/saved/mode and the measured handler duration. The previous
     // zero-filled append here overwrote every row with `orig=0 saved=0 mode=-`.
 
-    let current_count = server.call_count.load(std::sync::atomic::Ordering::Relaxed);
+    // The cloud/telemetry flush is scheduled at the top of `call_tool_guarded`
+    // (see `background_tick`): this function is skipped for guard-denied and
+    // response-cached calls, so counting here would miss them. Archive cleanup
+    // and knowledge consolidation stay on the dispatch path, where they only
+    // have work when a call actually produced output.
+    let current_count = server
+        .background_tick
+        .load(std::sync::atomic::Ordering::Relaxed);
     if current_count > 0 && current_count.is_multiple_of(100) {
-        std::thread::spawn(crate::cloud_sync::cloud_background_tasks);
         // Bound the on-disk archive between restarts: prune TTL-expired and
         // over-budget entries off the hot path so it can't grow unbounded and
         // starve the host of RAM via the page cache (#417).

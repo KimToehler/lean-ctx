@@ -104,6 +104,20 @@ impl LeanCtxServer {
         self.check_idle_expiry().await;
         self.resolve_roots_once().await;
         elicitation::increment_call();
+        // Background cadence, counted here because this is the one point every
+        // call passes regardless of how it is served: guard denials and
+        // response-cache hits below return before `dispatch_and_post_process`.
+        // It previously hung off `call_count`, which only advances in
+        // `record_checkpoint` — skipped entirely when `minimal_overhead`
+        // (default true) is set. Between the two, the daily telemetry flush
+        // never ran in a default install.
+        let tick = self
+            .background_tick
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if tick.is_multiple_of(100) {
+            std::thread::spawn(crate::cloud_sync::cloud_background_tasks);
+        }
 
         let original_name = request.name.as_ref().to_string();
         // Plan mode: extract interactionMode before arguments are consumed.
@@ -527,6 +541,31 @@ mod tests {
         for tool_name in ["ctx_search", "ctx_tree", "ctx_glob"] {
             assert!(response_cache_key(tool_name, None, "/project").is_some());
         }
+    }
+
+    /// The daily telemetry flush is scheduled off `background_tick`, so a call
+    /// rejected before dispatch must still advance it. Under the old gate
+    /// (`call_count`, only moved by `record_checkpoint`) a default install
+    /// never reached the cadence boundary and never sent a batch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_tick_counts_calls_rejected_before_dispatch() {
+        use std::sync::atomic::Ordering;
+
+        let _data_dir = crate::core::data_dir::isolated_data_dir();
+        let root = env!("CARGO_MANIFEST_DIR").to_string();
+        let server = crate::tools::LeanCtxServer::new_with_project_root(Some(&root));
+        // Skip bus registration: this test is about the cadence, not presence.
+        *server.presence_agent_id.write().await = Some("tick-test".to_string());
+
+        for expected in 1..=2 {
+            // `ctx` without `tool` is rejected before any dispatch or checkpoint.
+            let rejected = server
+                .call_tool_guarded(rmcp::model::CallToolRequestParams::new("ctx"))
+                .await;
+            assert!(rejected.is_err());
+            assert_eq!(server.background_tick.load(Ordering::Relaxed), expected);
+        }
+        assert_eq!(server.call_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]

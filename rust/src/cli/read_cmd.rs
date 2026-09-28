@@ -98,6 +98,52 @@ fn resolve_cli_read_mode(args: &[String]) -> String {
         .map_or_else(|| "auto".to_string(), std::clone::Clone::clone)
 }
 
+/// Env vars that change how a read is rendered but only exist in the caller's
+/// process — a long-lived daemon never sees them (#1889). The daemon path is
+/// Unix-only, so these are too.
+#[cfg(unix)]
+const CALLER_OUTPUT_OVERRIDES: [&str; 3] = [
+    "LEAN_CTX_CRP_MODE",
+    "LEAN_CTX_COMPRESSION",
+    "LEAN_CTX_PROFILE",
+];
+
+#[cfg(unix)]
+fn has_caller_output_override() -> bool {
+    CALLER_OUTPUT_OVERRIDES
+        .iter()
+        .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()))
+}
+
+/// Appends the API symbol lines the same way the MCP renderer does
+/// (`ctx_read::render`): TDD notation plus its one-line legend under
+/// `CrpMode::Tdd`, compact notation otherwise (#1889). `legend_inline` puts the
+/// legend on the current line (map's `API:` header) instead of its own line.
+fn push_signature_lines(
+    out: &mut String,
+    sigs: &[&signatures::Signature],
+    crp: crate::tools::CrpMode,
+    indent: &str,
+    legend_inline: bool,
+) {
+    if crp.is_tdd() {
+        let legend = signatures::tdd_legend(sigs);
+        if !legend.is_empty() {
+            out.push(if legend_inline { ' ' } else { '\n' });
+            out.push_str(&legend);
+        }
+    }
+    for sig in sigs {
+        out.push('\n');
+        out.push_str(indent);
+        if crp.is_tdd() {
+            out.push_str(&sig.to_tdd_located());
+        } else {
+            out.push_str(&sig.to_compact_located());
+        }
+    }
+}
+
 pub fn cmd_read(args: &[String]) {
     if args.is_empty() {
         eprintln!(
@@ -156,8 +202,11 @@ pub fn cmd_read(args: &[String]) {
 
     #[cfg(unix)]
     {
+        // The shared daemon renders with *its* environment, so a caller-scoped
+        // output override (#1889) must be served by the standalone path.
         #[cfg(unix)]
         if !crate::core::pathutil::is_under_tcc_protected_dir(std::path::Path::new(path))
+            && !has_caller_output_override()
             && let Some(out) = crate::daemon_client::try_daemon_tool_call_blocking_text(
                 "ctx_read",
                 Some(serde_json::json!({
@@ -303,9 +352,13 @@ pub fn cmd_read(args: &[String]) {
                 }
                 if !key_sigs.is_empty() {
                     buf.push_str("\n  API:");
-                    for sig in &key_sigs {
-                        buf.push_str(&format!("\n    {}", sig.to_compact_located()));
-                    }
+                    push_signature_lines(
+                        &mut buf,
+                        &key_sigs,
+                        crate::tools::CrpMode::effective(),
+                        "    ",
+                        true,
+                    );
                 }
                 // Same honesty rule as the MCP renderer: an information-free
                 // map must say so (limitations audit, #4).
@@ -336,9 +389,14 @@ pub fn cmd_read(args: &[String]) {
         "signatures" => {
             let sigs = signatures::extract_signatures(&content, ext);
             let mut output_buf = format!("{short} [{line_count}L]");
-            for sig in &sigs {
-                output_buf.push_str(&format!("\n{}", sig.to_compact_located()));
-            }
+            let refs: Vec<&signatures::Signature> = sigs.iter().collect();
+            push_signature_lines(
+                &mut output_buf,
+                &refs,
+                crate::tools::CrpMode::effective(),
+                "",
+                false,
+            );
             // Same honesty rule as the MCP renderer (limitations audit, #4).
             if sigs.is_empty() {
                 output_buf.push_str(&crate::tools::ctx_read::no_structure_marker(ext));
@@ -934,5 +992,95 @@ mod mode_arg_tests {
         assert_eq!(resolve_cli_read_mode(&args(&["f.rs", "--fresh"])), "auto");
         // An unknown positional is not silently treated as a mode.
         assert_eq!(resolve_cli_read_mode(&args(&["f.rs", "banana"])), "auto");
+    }
+}
+
+/// #1889: the CLI and the MCP server must render the same symbol lines (and
+/// the same TDD legend) for map/signatures under every CRP mode.
+#[cfg(test)]
+mod crp_parity_tests {
+    use super::push_signature_lines;
+    use crate::core::cache::SessionCache;
+    use crate::core::signatures;
+    use crate::tools::CrpMode;
+
+    /// Bodies are long so map/signatures are clearly smaller than the file —
+    /// otherwise the MCP never-inflate guard serves the raw file instead.
+    fn src() -> String {
+        use std::fmt::Write as _;
+        let body = (0..60).fold(String::new(), |mut acc, i| {
+            let _ = writeln!(acc, "    let v{i} = source.len() as u64 + {i};");
+            acc
+        });
+        format!(
+            "pub struct Totals {{ pub n: u64 }}\n\n\
+             pub fn count_source(source: &'static str) -> u64 {{\n{body}    0\n}}\n\n\
+             pub fn source_counts() -> Vec<(&'static str, u64)> {{\n    let source = \"\";\n{body}    Vec::new()\n}}\n\n\
+             fn private_helper(x: i32) -> i32 {{\n    let source = \"\";\n{body}    x + 1\n}}\n"
+        )
+    }
+
+    fn mcp(mode: &str, crp: CrpMode) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("parity.rs");
+        std::fs::write(&file, src()).unwrap();
+        let mut cache = SessionCache::new();
+        crate::tools::ctx_read::handle_fresh(&mut cache, &file.to_string_lossy(), mode, crp)
+    }
+
+    fn assert_lines_in(cli: &str, mcp: &str, what: &str) {
+        for line in cli.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            assert!(
+                mcp.lines()
+                    .any(|m| m.trim_start().starts_with(line) || m.contains(line)),
+                "{what}: CLI line `{line}` missing from MCP output:\n{mcp}"
+            );
+        }
+    }
+
+    #[test]
+    fn signatures_match_mcp_for_every_crp_mode() {
+        let sigs = signatures::extract_signatures(&src(), "rs");
+        let refs: Vec<&signatures::Signature> = sigs.iter().collect();
+        for crp in [CrpMode::Off, CrpMode::Compact, CrpMode::Tdd] {
+            let mut cli = String::new();
+            push_signature_lines(&mut cli, &refs, crp, "", false);
+            assert_lines_in(&cli, &mcp("signatures", crp), crp.as_str());
+            assert_eq!(
+                cli.contains("λ=fn"),
+                crp.is_tdd(),
+                "legend iff tdd ({crp:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn map_api_matches_mcp_for_every_crp_mode() {
+        let sigs = signatures::extract_signatures(&src(), "rs");
+        let key: Vec<&signatures::Signature> = sigs
+            .iter()
+            .filter(|s| s.is_exported || s.indent == 0)
+            .collect();
+        for crp in [CrpMode::Off, CrpMode::Compact, CrpMode::Tdd] {
+            let mut cli = String::from("  API:");
+            push_signature_lines(&mut cli, &key, crp, "    ", true);
+            let out = mcp("map", crp);
+            let api_header = cli.lines().next().unwrap();
+            assert!(
+                out.contains(api_header),
+                "{crp:?}: header `{api_header}` in\n{out}"
+            );
+            assert_lines_in(&cli, &out, crp.as_str());
+        }
+    }
+
+    #[test]
+    fn tdd_uses_symbol_notation_not_compact() {
+        let sigs = signatures::extract_signatures(&src(), "rs");
+        let refs: Vec<&signatures::Signature> = sigs.iter().collect();
+        let mut tdd = String::new();
+        push_signature_lines(&mut tdd, &refs, CrpMode::Tdd, "", false);
+        assert!(tdd.contains("λ+count_source"), "{tdd}");
+        assert!(!tdd.contains("fn pub count_source"), "{tdd}");
     }
 }

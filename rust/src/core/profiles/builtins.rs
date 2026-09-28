@@ -20,7 +20,7 @@ pub(super) fn builtin_coder() -> Profile {
             prefer_cache: Some(true),
         },
         compression: CompressionConfig {
-            crp_mode: Some("tdd".to_string()),
+            crp_mode: None,
             output_density: Some("terse".to_string()),
             terse_mode: Some(true),
             ..CompressionConfig::default()

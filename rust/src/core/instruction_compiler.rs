@@ -51,12 +51,11 @@ pub(crate) fn compile(
 
     let profile = profiles::load_profile(profile_name)
         .ok_or_else(|| format!("unknown profile '{profile_name}'"))?;
-    let engine = profile.engine_config();
-
-    let crp_mode = opts
-        .crp_mode_override
-        .or_else(|| CrpMode::parse(engine.compression.crp_mode))
-        .unwrap_or(CrpMode::Tdd);
+    // Same resolver the MCP server and every tool use (#1890): the Engine seam
+    // projects `CrpMode::resolve` for this profile.
+    let crp_mode = opts.crp_mode_override.unwrap_or_else(|| {
+        CrpMode::parse(profile.engine_config().compression.crp_mode).unwrap_or(CrpMode::Off)
+    });
 
     let mcp_instructions = crate::instructions::build_instructions_with_client_for_compiler(
         crp_mode,
@@ -87,12 +86,7 @@ pub(crate) fn compile(
         schema_version: 1,
         client: client_id.to_string(),
         profile: profile.profile.name,
-        crp_mode: match crp_mode {
-            CrpMode::Off => "off",
-            CrpMode::Compact => "compact",
-            CrpMode::Tdd => "tdd",
-        }
-        .to_string(),
+        crp_mode: crp_mode.as_str().to_string(),
         unified_tool_mode: opts.unified,
         mcp_instructions,
         rules_files,
@@ -105,6 +99,9 @@ mod tests {
 
     #[test]
     fn compiled_instructions_are_deterministic() {
+        // The guidance reads env + Config::load(); parallel env-mutating tests
+        // would otherwise change the text between the two compiles.
+        let _lock = crate::core::data_dir::test_env_lock();
         let a = compile(
             "cursor",
             "exploration",
@@ -147,6 +144,31 @@ mod tests {
                 c.id
             );
         }
+    }
+
+    /// #1890: `lean-ctx instructions` and the MCP server/tool layer must agree
+    /// on the CRP mode for every built-in profile (default config included).
+    #[test]
+    fn compiled_crp_mode_matches_tool_resolver() {
+        let _lock = crate::core::data_dir::test_env_lock();
+        for name in ["coder", "exploration", "bugfix", "review", "passthrough"] {
+            let out = compile("claude-code", name, CompileOptions::default()).unwrap();
+            let profile = profiles::load_profile(name).unwrap();
+            let tools = CrpMode::resolve(profile.compression.crp_mode.as_deref());
+            assert_eq!(out.crp_mode, tools.as_str(), "profile {name}");
+            let expected = crate::instructions::build_instructions_with_client_for_compiler(
+                tools,
+                "claude-code",
+                false,
+            );
+            assert_eq!(out.mcp_instructions, expected, "profile {name}");
+        }
+    }
+
+    #[test]
+    fn default_coder_profile_does_not_force_tdd() {
+        let coder = profiles::load_profile("coder").unwrap();
+        assert_eq!(coder.compression.crp_mode, None);
     }
 
     #[test]

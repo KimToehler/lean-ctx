@@ -608,7 +608,7 @@ pub(crate) fn stub_policy_allows() -> bool {
     let prof = crate::core::profiles::active_profile();
     let force_full = no_deg
         || (prof.read.default_mode_effective() == "full"
-            && prof.compression.crp_mode_effective() == "off");
+            && prof.compression.crp_mode.as_deref() == Some("off"));
     crate::server::compaction_sync::effective_cache_policy() != "safe" && !force_full
 }
 

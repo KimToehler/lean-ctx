@@ -84,8 +84,10 @@ pub struct CompressionConfig {
 }
 
 impl CompressionConfig {
-    pub fn crp_mode_effective(&self) -> &str {
-        self.crp_mode.as_deref().unwrap_or("tdd")
+    /// The CRP mode this profile actually produces, after env and
+    /// `compression_level` precedence — the same value tools use (#1890).
+    pub fn crp_mode_effective(&self) -> &'static str {
+        crate::core::protocol::CrpMode::resolve(self.crp_mode.as_deref()).as_str()
     }
     pub fn output_density_effective(&self) -> &str {
         self.output_density.as_deref().unwrap_or("normal")

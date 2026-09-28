@@ -1,5 +1,6 @@
 use super::builtins::{builtin_exploration, builtin_profiles};
 use super::*;
+use crate::core::protocol::CrpMode;
 
 #[test]
 fn builtin_profiles_count() {
@@ -48,7 +49,10 @@ fn engine_config_projects_consumed_mechanisms_without_changing_legacy_toml() {
     let engine = profile.engine_config();
 
     assert_eq!(engine.read.default_mode, "map");
-    assert_eq!(engine.compression.crp_mode, "tdd");
+    assert_eq!(
+        engine.compression.crp_mode,
+        CrpMode::resolve(builtin_exploration().compression.crp_mode.as_deref()).as_str()
+    );
     assert_eq!(format_as_toml(&profile), before);
 }
 
@@ -64,7 +68,10 @@ fn engine_config_excludes_product_policy() {
 
     let engine = profile.engine_config();
     assert_eq!(engine.read.default_mode, "map");
-    assert_eq!(engine.compression.crp_mode, "tdd");
+    assert_eq!(
+        engine.compression.crp_mode,
+        CrpMode::resolve(builtin_exploration().compression.crp_mode.as_deref()).as_str()
+    );
 }
 
 #[test]
@@ -219,7 +226,7 @@ fn default_profile_has_sane_values() {
         output_hints: OutputHints::default(),
     };
     assert_eq!(p.read.default_mode_effective(), "auto");
-    assert_eq!(p.compression.crp_mode_effective(), "tdd");
+    assert_eq!(p.compression.crp_mode, None);
     assert_eq!(p.budget.max_context_tokens_effective(), 200_000);
     assert!(p.pipeline.compression_effective());
     assert!(p.pipeline.intent_effective());
@@ -255,7 +262,7 @@ default_mode = "entropy"
     assert_eq!(p.read.default_mode_effective(), "entropy");
     assert_eq!(p.read.max_tokens_per_file_effective(), 50_000);
     assert_eq!(p.budget.max_context_tokens_effective(), 200_000);
-    assert_eq!(p.compression.crp_mode_effective(), "tdd");
+    assert_eq!(p.compression.crp_mode, None);
 }
 
 #[test]

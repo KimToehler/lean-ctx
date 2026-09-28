@@ -19,6 +19,51 @@ impl CrpMode {
             _ => None,
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Compact => "compact",
+            Self::Tdd => "tdd",
+        }
+    }
+
+    /// The single CRP resolver (#1890): tool output, MCP instructions and
+    /// `lean-ctx instructions` all go through here, so they can never disagree.
+    /// `profile_crp` is the profile's own `compression.crp_mode`, if it sets one.
+    pub fn resolve(profile_crp: Option<&str>) -> Self {
+        use crate::core::config::{CompressionLevel, Config};
+        let env = std::env::var("LEAN_CTX_CRP_MODE").ok();
+        let forced = CompressionLevel::session_degrade_level().or_else(CompressionLevel::from_env);
+        let configured = CompressionLevel::effective(&Config::load());
+        Self::resolve_from(env.as_deref(), forced, configured, profile_crp)
+    }
+
+    /// Precedence: `LEAN_CTX_CRP_MODE` → a forced level (correction-loop
+    /// degrade, `LEAN_CTX_COMPRESSION`) → a configured `compression_level` that
+    /// implies CRP (standard/max/raw) → the profile's `crp_mode` → off.
+    /// `off`/`lite` only shape prose, so they leave the choice to the profile.
+    pub(crate) fn resolve_from(
+        env: Option<&str>,
+        forced: Option<crate::core::config::CompressionLevel>,
+        configured: crate::core::config::CompressionLevel,
+        profile_crp: Option<&str>,
+    ) -> Self {
+        let level_crp = |level: crate::core::config::CompressionLevel| {
+            Self::parse(level.to_components().2).unwrap_or(Self::Off)
+        };
+        if let Some(v) = env.filter(|v| !v.trim().is_empty()) {
+            return Self::parse(v).unwrap_or(Self::Off);
+        }
+        if let Some(level) = forced {
+            return level_crp(level);
+        }
+        let configured = level_crp(configured);
+        if configured != Self::Off {
+            return configured;
+        }
+        profile_crp.and_then(Self::parse).unwrap_or(Self::Off)
+    }
 }
 
 /// Recorded metrics for a single MCP tool invocation.
@@ -654,5 +699,39 @@ mod tests {
         crate::test_env::remove_var("LEAN_CTX_SHOW_SAVINGS");
         crate::test_env::remove_var("LEAN_CTX_SAVINGS_FOOTER");
         crate::test_env::remove_var("LEAN_CTX_COMPRESSION_ANNOTATION");
+    }
+
+    /// #1890: one precedence chain — env → forced level → CRP-implying
+    /// configured level → profile → off.
+    #[test]
+    fn crp_resolution_precedence() {
+        use crate::core::config::CompressionLevel as L;
+        let r = CrpMode::resolve_from;
+        // Default config (Lite) + default profile (no crp_mode) → off.
+        assert_eq!(r(None, None, L::Lite, None), CrpMode::Off);
+        // A profile's crp_mode is honoured when nothing overrides it.
+        assert_eq!(r(None, None, L::Lite, Some("tdd")), CrpMode::Tdd);
+        assert_eq!(r(None, None, L::Off, Some("compact")), CrpMode::Compact);
+        // A configured level that implies CRP beats the profile.
+        assert_eq!(r(None, None, L::Standard, Some("tdd")), CrpMode::Compact);
+        assert_eq!(r(None, None, L::Max, Some("off")), CrpMode::Tdd);
+        // A forced level (env / correction-loop degrade) beats the profile.
+        assert_eq!(r(None, Some(L::Lite), L::Max, Some("tdd")), CrpMode::Off);
+        // LEAN_CTX_CRP_MODE wins over everything; invalid values fail safe.
+        assert_eq!(
+            r(Some("tdd"), Some(L::Off), L::Off, Some("off")),
+            CrpMode::Tdd
+        );
+        assert_eq!(r(Some("bogus"), None, L::Max, Some("tdd")), CrpMode::Off);
+        assert_eq!(r(Some("  "), None, L::Lite, Some("tdd")), CrpMode::Tdd);
+        // Unknown profile values fall back to off.
+        assert_eq!(r(None, None, L::Lite, Some("weird")), CrpMode::Off);
+    }
+
+    #[test]
+    fn crp_mode_str_round_trips() {
+        for m in [CrpMode::Off, CrpMode::Compact, CrpMode::Tdd] {
+            assert_eq!(CrpMode::parse(m.as_str()), Some(m));
+        }
     }
 }

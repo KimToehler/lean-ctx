@@ -52,7 +52,7 @@ vor dem Versand geprüft; gültige V2-Wire-Bytes bleiben unverändert.
 
 ## 3. Ereignisfamilien
 
-Zwanzig typisierte Varianten. Keine trägt Freitext.
+Zweiundzwanzig typisierte Varianten. Keine trägt Freitext.
 
 Das Ereignisobjekt erlaubt ausschließlich `name` und `metrics`; zusätzliche
 Felder werden bereits beim Deserialisieren abgewiesen, auch innerhalb eines
@@ -62,9 +62,11 @@ bleiben unverändert; die Korrektur erweitert das erlaubte Schema nicht.
 | Ereignis | Metrik-Typ |
 |---|---|
 | `heartbeat` | `HeartbeatMetrics` |
+| `setup_profile` | `SetupProfileMetrics` |
 | `setup_completed`, `integration_detected` | `OccurrenceMetrics` |
 | `session_aggregate` | `SessionMetrics` |
 | `tool_usage_aggregate` | `ToolUsageMetrics` |
+| `tool_call_aggregate` | `ToolCallMetrics` |
 | `autopilot_aggregate`, `autopilot_fallback_aggregate` | `DecisionMetrics` |
 | `sync_aggregate` | `SyncMetrics` |
 | `trial_started`, `upgrade_viewed`, `checkout_started`, `subscription_activated`, `subscription_cancelled`, `team_created`, `team_member_invited` | `OccurrenceMetrics` |
@@ -85,11 +87,34 @@ Löschung mit der Installation. Abweichungen sind vermerkt.
 | Feld | Werte | Zweck | Optional |
 |---|---|---|---|
 | `distribution_channel` | `cargo`, `homebrew`, `npm`, `docker`, `source`, `unknown` | Kanalverteilung | nein |
-| `client_family` | `claude`, `codex`, `cursor`, `gemini`, `other` | grobe Client-Kohorte | nein |
+| `client_family` | `claude`, `codex`, `cursor`, `gemini`, `windsurf`, `zed`, `vscode_copilot`, `kiro`, `antigravity`, `codebuddy`, `codewhale`, `other` | Client-Kohorte (aus dem MCP-Handshake, sonst Umgebungsvariablen; unbekannte Clients werden `other`, nie Klartext) | nein |
 | `operating_system` | `macos`, `linux`, `windows`, `other` | Plattformverteilung | nein |
 | `architecture` | `x86_64`, `aarch64`, `other` | Build-Priorisierung | nein |
 
 Alle vier sind geschlossene Aufzählungen — keine freien Zeichenketten.
+
+### `SetupProfileMetrics`
+
+Einmal je Tagesbatch, Momentaufnahme der Einrichtung.
+
+| Feld | Werte | Zweck | Optional |
+|---|---|---|---|
+| `integration_mode` | `default`, `mcp`, `hybrid`, `replace` | welcher Integrationsmodus genutzt wird (`default` = nie gesetzt) | nein |
+| `embeddings` | `unsupported`, `disabled`, `not_installed`, `installed` | Verbreitung der semantischen Suche | nein |
+
+Nicht enthalten: Modellname, Pfade, Konfigurationswerte, Projektanzahl.
+
+### `ToolCallMetrics`
+
+| Feld | Werte | Zweck | Optional |
+|---|---|---|---|
+| `tools[].tool` | Name eines **eingebauten** lean-ctx-Tools (`[a-z][a-z0-9_]*`, ≤ 64 Byte) | welche Tools tatsächlich genutzt werden | nein |
+| `tools[].calls`, `tools[].failures` | Zähler seit dem letzten bestätigten Batch | Nutzung und Fehlerquote je Tool | nein |
+
+Namen stammen ausschließlich aus der statischen Tool-Registry des Binaries;
+Tools fremder MCP-Server, Argumente und Ergebnisse werden nie gezählt. Liste
+strikt sortiert und eindeutig, höchstens `MAX_TOOL_ENTRIES` (128) Einträge
+(bei Überlauf die meistgenutzten), `failures ≤ calls`, `calls ≥ 1`.
 
 ### Zählerstrukturen
 

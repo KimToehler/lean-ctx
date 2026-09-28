@@ -453,11 +453,13 @@ impl LeanCtxServer {
             .clone()
             .unwrap_or_default();
         let cache_key = response_cache_key(name, args, &project_root);
+        let call_start = std::time::Instant::now();
         if let Some(cached) = cache_key
             .as_ref()
             .and_then(|key| cached_call_result(global_response_cache(), key))
         {
             finish_decision_loop(decision_context.as_ref(), args, &cached);
+            self.record_tool_usage(name, call_start, cached.is_error != Some(true));
             return Ok(cached);
         }
 
@@ -474,10 +476,32 @@ impl LeanCtxServer {
             decision_context,
         )
         .await;
+        self.record_tool_usage(
+            name,
+            call_start,
+            result
+                .as_ref()
+                .is_ok_and(|response| response.is_error != Some(true)),
+        );
         if let (Some(key), Ok(response)) = (cache_key, &result) {
             cache_call_result(global_response_cache(), key, response);
         }
         result
+    }
+
+    /// Feed the daily telemetry aggregate. Only registered tools are counted,
+    /// under the registry's own name; calls stopped by a guard never reach
+    /// here and are not usage.
+    fn record_tool_usage(&self, name: &str, started: std::time::Instant, success: bool) {
+        let Some(tool) = self
+            .registry
+            .as_ref()
+            .and_then(|registry| registry.static_name(name))
+        else {
+            return;
+        };
+        let latency_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        crate::core::telemetry::global_metrics().record_named_tool_call(tool, latency_us, success);
     }
 }
 

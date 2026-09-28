@@ -10,6 +10,10 @@ pub const SCHEMA_VERSION: u16 = 2;
 pub const MAX_COUNT: u64 = 1_000_000_000;
 pub const MAX_HISTOGRAM_BUCKETS: usize = 32;
 pub const MAX_BATCH_EVENTS: usize = 64;
+/// Upper bound on distinct tools in one `tool_call_aggregate` event. The
+/// built-in registry holds fewer than 100 tools.
+pub const MAX_TOOL_ENTRIES: usize = 128;
+pub const MAX_TOOL_NAME_LEN: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -130,10 +134,12 @@ impl PseudonymousId {
 )]
 pub enum TelemetryEventV2 {
     Heartbeat(HeartbeatMetrics),
+    SetupProfile(SetupProfileMetrics),
     SetupCompleted(OccurrenceMetrics),
     IntegrationDetected(OccurrenceMetrics),
     SessionAggregate(SessionMetrics),
     ToolUsageAggregate(ToolUsageMetrics),
+    ToolCallAggregate(ToolCallMetrics),
     AutopilotAggregate(DecisionMetrics),
     AutopilotFallbackAggregate(DecisionMetrics),
     SyncAggregate(SyncMetrics),
@@ -155,10 +161,12 @@ impl TelemetryEventV2 {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Heartbeat(_) => "heartbeat",
+            Self::SetupProfile(_) => "setup_profile",
             Self::SetupCompleted(_) => "setup_completed",
             Self::IntegrationDetected(_) => "integration_detected",
             Self::SessionAggregate(_) => "session_aggregate",
             Self::ToolUsageAggregate(_) => "tool_usage_aggregate",
+            Self::ToolCallAggregate(_) => "tool_call_aggregate",
             Self::AutopilotAggregate(_) => "autopilot_aggregate",
             Self::AutopilotFallbackAggregate(_) => "autopilot_fallback_aggregate",
             Self::SyncAggregate(_) => "sync_aggregate",
@@ -180,6 +188,8 @@ impl TelemetryEventV2 {
     fn validate(&self) -> Result<(), TelemetryValidationError> {
         match self {
             Self::Heartbeat(metrics) => metrics.validate(),
+            // Both fields are closed enums: deserialization is the validation.
+            Self::SetupProfile(_) => Ok(()),
             Self::SetupCompleted(metrics)
             | Self::IntegrationDetected(metrics)
             | Self::TrialStarted(metrics)
@@ -191,6 +201,7 @@ impl TelemetryEventV2 {
             | Self::TeamMemberInvited(metrics) => metrics.validate(),
             Self::SessionAggregate(metrics) => metrics.validate(),
             Self::ToolUsageAggregate(metrics) => metrics.validate(),
+            Self::ToolCallAggregate(metrics) => metrics.validate(),
             Self::AutopilotAggregate(metrics) | Self::AutopilotFallbackAggregate(metrics) => {
                 metrics.validate()
             }
@@ -216,6 +227,37 @@ impl HeartbeatMetrics {
     fn validate(&self) -> Result<(), TelemetryValidationError> {
         Ok(())
     }
+}
+
+/// How this installation is wired up, as closed enums only: no paths,
+/// project names, model names or config values leave the machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupProfileMetrics {
+    pub integration_mode: IntegrationMode,
+    pub embeddings: EmbeddingsState,
+}
+
+/// Configured `hook_mode`; `Default` means the user never set one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationMode {
+    Default,
+    Mcp,
+    Hybrid,
+    Replace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingsState {
+    /// Built without the `embeddings` feature.
+    Unsupported,
+    /// Auto-download is turned off and no model is on disk.
+    Disabled,
+    /// Allowed but the model has not been downloaded yet.
+    NotInstalled,
+    Installed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,6 +316,65 @@ impl ToolUsageMetrics {
         }
         self.latency_milliseconds.validate()
     }
+}
+
+/// Per-tool call counts for one day.
+///
+/// Tool names are the static keys of the built-in tool registry, never
+/// caller-supplied strings: a name is a short `[a-z0-9_]` identifier, entries
+/// are sorted and unique, and every entry has at least one call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCallMetrics {
+    pub tools: Vec<ToolCallCount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCallCount {
+    pub tool: String,
+    pub calls: u64,
+    pub failures: u64,
+}
+
+impl ToolCallMetrics {
+    pub(crate) fn validate(&self) -> Result<(), TelemetryValidationError> {
+        if self.tools.is_empty() || self.tools.len() > MAX_TOOL_ENTRIES {
+            return Err(TelemetryValidationError::ToolEntries);
+        }
+        if !self
+            .tools
+            .windows(2)
+            .all(|pair| pair[0].tool < pair[1].tool)
+        {
+            return Err(TelemetryValidationError::ToolEntries);
+        }
+        self.tools.iter().try_for_each(ToolCallCount::validate)
+    }
+}
+
+impl ToolCallCount {
+    fn validate(&self) -> Result<(), TelemetryValidationError> {
+        if !valid_tool_name(&self.tool) {
+            return Err(TelemetryValidationError::ToolName);
+        }
+        bounded_many(&[self.calls, self.failures])?;
+        if self.calls == 0 || self.failures > self.calls {
+            return Err(TelemetryValidationError::InconsistentCounts);
+        }
+        Ok(())
+    }
+}
+
+/// `[a-z][a-z0-9_]*`, at most [`MAX_TOOL_NAME_LEN`] bytes.
+pub fn valid_tool_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_TOOL_NAME_LEN
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,7 +515,36 @@ pub enum ClientFamily {
     Codex,
     Cursor,
     Gemini,
+    Windsurf,
+    Zed,
+    VscodeCopilot,
+    Kiro,
+    Antigravity,
+    Codebuddy,
+    Codewhale,
     Other,
+}
+
+impl ClientFamily {
+    /// Maps a `client_capabilities` client id (from the MCP initialize
+    /// handshake) onto the fixed wire enum; unknown ids never leak as text.
+    #[must_use]
+    pub fn from_client_id(id: &str) -> Option<Self> {
+        Some(match id {
+            "claude-code" => Self::Claude,
+            "codex" => Self::Codex,
+            "cursor" => Self::Cursor,
+            "gemini-cli" => Self::Gemini,
+            "windsurf" => Self::Windsurf,
+            "zed" => Self::Zed,
+            "vscode-copilot" => Self::VscodeCopilot,
+            "kiro" => Self::Kiro,
+            "antigravity" => Self::Antigravity,
+            "codebuddy" => Self::Codebuddy,
+            "codewhale" => Self::Codewhale,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -483,6 +613,8 @@ pub enum TelemetryValidationError {
     Histogram,
     VersionDirection,
     BatchSize,
+    ToolEntries,
+    ToolName,
 }
 
 fn bounded(value: u64) -> Result<(), TelemetryValidationError> {
@@ -733,5 +865,121 @@ mod tests {
         decoded.validate().unwrap();
         assert_eq!(decoded, event_with_ids);
         assert_eq!(serde_json::to_vec(&decoded).unwrap(), encoded);
+    }
+
+    fn tool_call(tool: &str, calls: u64, failures: u64) -> ToolCallCount {
+        ToolCallCount {
+            tool: tool.into(),
+            calls,
+            failures,
+        }
+    }
+
+    fn tool_call_event(tools: Vec<ToolCallCount>) -> TelemetryEnvelopeV2 {
+        envelope(TelemetryEventV2::ToolCallAggregate(ToolCallMetrics {
+            tools,
+        }))
+    }
+
+    #[test]
+    fn setup_profile_is_closed_enums_on_the_wire() {
+        let event = TelemetryEventV2::SetupProfile(SetupProfileMetrics {
+            integration_mode: IntegrationMode::Replace,
+            embeddings: EmbeddingsState::NotInstalled,
+        });
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "name": "setup_profile",
+                "metrics": {"integration_mode": "replace", "embeddings": "not_installed"}
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<TelemetryEventV2>(json).unwrap(),
+            event
+        );
+        for bad in [
+            serde_json::json!({"name": "setup_profile", "metrics": {"integration_mode": "/home/me", "embeddings": "installed"}}),
+            serde_json::json!({"name": "setup_profile", "metrics": {"integration_mode": "mcp", "embeddings": "installed", "model": "x"}}),
+        ] {
+            assert!(serde_json::from_value::<TelemetryEventV2>(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn every_detected_client_id_maps_to_a_stable_wire_family() {
+        let cases = [
+            ("claude-code", "claude"),
+            ("codex", "codex"),
+            ("cursor", "cursor"),
+            ("gemini-cli", "gemini"),
+            ("windsurf", "windsurf"),
+            ("zed", "zed"),
+            ("vscode-copilot", "vscode_copilot"),
+            ("kiro", "kiro"),
+            ("antigravity", "antigravity"),
+            ("codebuddy", "codebuddy"),
+            ("codewhale", "codewhale"),
+        ];
+        for (id, wire) in cases {
+            let family = ClientFamily::from_client_id(id).expect(id);
+            assert_eq!(serde_json::to_value(family).unwrap(), wire);
+        }
+        assert_eq!(ClientFamily::from_client_id("unknown"), None);
+        assert_eq!(ClientFamily::from_client_id("my-private-fork"), None);
+    }
+
+    #[test]
+    fn tool_call_aggregate_roundtrips_on_the_wire() {
+        let event = tool_call_event(vec![tool_call("ctx_read", 5, 1), tool_call("shell", 2, 0)]);
+        event.validate().unwrap();
+        let encoded = serde_json::to_string(&event.event).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"name":"tool_call_aggregate","metrics":{"tools":[{"tool":"ctx_read","calls":5,"failures":1},{"tool":"shell","calls":2,"failures":0}]}}"#
+        );
+        let decoded: TelemetryEnvelopeV2 =
+            serde_json::from_slice(&serde_json::to_vec(&event).unwrap()).unwrap();
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn tool_call_aggregate_rejects_free_text_and_inconsistent_entries() {
+        let reject = |tools: Vec<ToolCallCount>, expected| {
+            assert_eq!(tool_call_event(tools).validate(), Err(expected));
+        };
+        use TelemetryValidationError::{InconsistentCounts, ToolEntries, ToolName};
+        reject(Vec::new(), ToolEntries);
+        reject(
+            vec![tool_call("ctx_shell", 1, 0), tool_call("ctx_read", 1, 0)],
+            ToolEntries,
+        );
+        reject(
+            vec![tool_call("ctx_read", 1, 0), tool_call("ctx_read", 1, 0)],
+            ToolEntries,
+        );
+        for name in [
+            "",
+            "Ctx_read",
+            "ctx-read",
+            "/etc/passwd",
+            "ctx read",
+            "_ctx",
+        ] {
+            reject(vec![tool_call(name, 1, 0)], ToolName);
+        }
+        reject(
+            vec![tool_call(&"a".repeat(MAX_TOOL_NAME_LEN + 1), 1, 0)],
+            ToolName,
+        );
+        reject(vec![tool_call("ctx_read", 0, 0)], InconsistentCounts);
+        reject(vec![tool_call("ctx_read", 1, 2)], InconsistentCounts);
+        let too_many = (0..=MAX_TOOL_ENTRIES)
+            .map(|index| tool_call(&format!("tool_{index:04}"), 1, 0))
+            .collect();
+        reject(too_many, ToolEntries);
+        let unknown_field = r#"{"name":"tool_call_aggregate","metrics":{"tools":[{"tool":"ctx_read","calls":1,"failures":0,"path":"/secret"}]}}"#;
+        assert!(serde_json::from_str::<TelemetryEventV2>(unknown_field).is_err());
     }
 }

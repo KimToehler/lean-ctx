@@ -3,7 +3,7 @@
 //! Privacy-safe daily telemetry aggregation.
 
 use sha2::Digest;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -12,10 +12,11 @@ use serde::{Deserialize, Serialize};
 
 use super::installation_id;
 use super::telemetry_v2::{
-    Architecture, ClientFamily, DecisionMetrics, DistributionChannel, ErrorCategory, ErrorMetrics,
-    HeartbeatMetrics, Histogram, MAX_COUNT, OccurrenceMetrics, OperatingSystem, SCHEMA_VERSION,
-    SessionMetrics, SyncMetrics, TelemetryBatchV2, TelemetryEnvelopeV2, TelemetryEventV2,
-    ToolUsageMetrics, VersionUpgradeMetrics,
+    Architecture, ClientFamily, DecisionMetrics, DistributionChannel, EmbeddingsState,
+    ErrorCategory, ErrorMetrics, HeartbeatMetrics, Histogram, IntegrationMode, MAX_COUNT,
+    MAX_TOOL_ENTRIES, OccurrenceMetrics, OperatingSystem, SCHEMA_VERSION, SessionMetrics,
+    SetupProfileMetrics, SyncMetrics, TelemetryBatchV2, TelemetryEnvelopeV2, TelemetryEventV2,
+    ToolCallCount, ToolCallMetrics, ToolUsageMetrics, VersionUpgradeMetrics, valid_tool_name,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -25,6 +26,16 @@ struct CounterCheckpoint {
     tool_failures: u64,
     tool_latency_buckets: [u64; crate::core::telemetry::TOOL_LATENCY_BUCKET_UPPER_MS.len()],
     session_uptime_secs: u64,
+    /// Per-tool counters. Absent in state written before per-tool counting.
+    #[serde(default)]
+    tools: BTreeMap<String, ToolCounterCheckpoint>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolCounterCheckpoint {
+    calls: u64,
+    failures: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -386,6 +397,10 @@ fn build_daily_aggregate(
     let common = batch.events[0].clone();
     batch.events.push(envelope_like(
         &common,
+        TelemetryEventV2::SetupProfile(setup_profile()),
+    ));
+    batch.events.push(envelope_like(
+        &common,
         TelemetryEventV2::SessionAggregate(SessionMetrics {
             sessions: 1,
             duration_seconds: single_observation_histogram(
@@ -416,6 +431,13 @@ fn build_daily_aggregate(
             },
         }),
     ));
+    let tools = tool_call_deltas(&observed.tools, &baseline.tools);
+    if !tools.is_empty() {
+        batch.events.push(envelope_like(
+            &common,
+            TelemetryEventV2::ToolCallAggregate(ToolCallMetrics { tools }),
+        ));
+    }
     if queued.setup_completed {
         batch.events.push(envelope_like(
             &common,
@@ -492,6 +514,35 @@ fn bounded_histogram_delta<const N: usize>(observed: &[u64; N], baseline: &[u64;
     })
 }
 
+/// Per-tool calls since the baseline. Names failing the contract format are
+/// dropped; past [`MAX_TOOL_ENTRIES`] the most-called tools are kept. The
+/// result is sorted by name, as the contract requires.
+fn tool_call_deltas(
+    observed: &BTreeMap<String, ToolCounterCheckpoint>,
+    baseline: &BTreeMap<String, ToolCounterCheckpoint>,
+) -> Vec<ToolCallCount> {
+    let mut tools: Vec<ToolCallCount> = observed
+        .iter()
+        .filter(|(tool, _)| valid_tool_name(tool))
+        .filter_map(|(tool, counter)| {
+            let base = baseline.get(tool).copied().unwrap_or_default();
+            let calls = counter.calls.saturating_sub(base.calls).min(MAX_COUNT);
+            let failures = counter.failures.saturating_sub(base.failures).min(calls);
+            (calls > 0).then(|| ToolCallCount {
+                tool: tool.clone(),
+                calls,
+                failures,
+            })
+        })
+        .collect();
+    if tools.len() > MAX_TOOL_ENTRIES {
+        tools.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.tool.cmp(&b.tool)));
+        tools.truncate(MAX_TOOL_ENTRIES);
+        tools.sort_by(|a, b| a.tool.cmp(&b.tool));
+    }
+    tools
+}
+
 fn envelope_like(template: &TelemetryEnvelopeV2, event: TelemetryEventV2) -> TelemetryEnvelopeV2 {
     TelemetryEnvelopeV2 {
         schema_version: template.schema_version,
@@ -524,6 +575,19 @@ fn current_checkpoint() -> CounterCheckpoint {
         tool_failures: snapshot.tool_failures,
         tool_latency_buckets: snapshot.tool_latency_buckets,
         session_uptime_secs: snapshot.session_uptime_secs,
+        tools: snapshot
+            .per_tool
+            .into_iter()
+            .map(|(tool, counter)| {
+                (
+                    tool.to_string(),
+                    ToolCounterCheckpoint {
+                        calls: counter.calls,
+                        failures: counter.failures,
+                    },
+                )
+            })
+            .collect(),
     }
 }
 
@@ -1072,7 +1136,49 @@ fn distribution_channel() -> DistributionChannel {
     }
 }
 
+fn setup_profile() -> SetupProfileMetrics {
+    let integration_mode = match crate::core::config::Config::load().hook_mode_override() {
+        None => IntegrationMode::Default,
+        Some(crate::hooks::HookMode::Mcp) => IntegrationMode::Mcp,
+        Some(crate::hooks::HookMode::Hybrid) => IntegrationMode::Hybrid,
+        Some(crate::hooks::HookMode::Replace) => IntegrationMode::Replace,
+    };
+    SetupProfileMetrics {
+        integration_mode,
+        embeddings: embeddings_state(),
+    }
+}
+
+#[cfg(feature = "embeddings")]
+fn embeddings_state() -> EmbeddingsState {
+    if crate::core::embeddings::EmbeddingEngine::is_available() {
+        EmbeddingsState::Installed
+    } else if crate::tools::ctx_knowledge::embeddings_auto_download_allowed() {
+        EmbeddingsState::NotInstalled
+    } else {
+        EmbeddingsState::Disabled
+    }
+}
+
+#[cfg(not(feature = "embeddings"))]
+fn embeddings_state() -> EmbeddingsState {
+    EmbeddingsState::Unsupported
+}
+
+/// Client that drives this installation: the MCP handshake of this process,
+/// then the last handshake persisted by any process (the daemon and CLI never
+/// see one themselves), then the host's environment variables.
 fn client_family() -> ClientFamily {
+    const PERSISTED_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+    let handshake = Some(crate::core::client_capabilities::current().client_id)
+        .filter(|id| id != "unknown")
+        .or_else(|| {
+            crate::core::client_capabilities::load_persisted(PERSISTED_MAX_AGE_SECS)
+                .map(|caps| caps.client_id)
+        });
+    if let Some(family) = handshake.as_deref().and_then(ClientFamily::from_client_id) {
+        return family;
+    }
     if std::env::var_os("CLAUDECODE").is_some() {
         ClientFamily::Claude
     } else if std::env::var_os("CODEX_HOME").is_some() {

@@ -6,7 +6,7 @@ use crate::core::config;
 use crate::core::installation_id;
 use std::io::IsTerminal;
 
-const DEFAULT_ON_NOTICE: &str = "LeanCTX anonymous product telemetry is enabled by default.\n\nSent: version, OS/arch, anonymous install ID, coarse feature/health aggregates.\nNever sent: prompts, source code, file contents, filenames, commands, secrets.\n\nInspect:  lean-ctx telemetry show\nDisable:  lean-ctx telemetry off\nHistory:  lean-ctx telemetry history";
+const DEFAULT_ON_NOTICE: &str = "LeanCTX anonymous product telemetry is enabled by default.\n\nSent: version, OS/arch, anonymous install ID, AI client family, integration mode, daily call counts per built-in lean-ctx tool, coarse feature/health aggregates.\nNever sent: prompts, source code, file contents, filenames, commands, secrets.\n\nInspect:  lean-ctx telemetry show\nDisable:  lean-ctx telemetry off\nHistory:  lean-ctx telemetry history";
 
 pub(crate) fn maybe_show_default_on_notice() {
     let terminal = std::io::stderr().is_terminal();

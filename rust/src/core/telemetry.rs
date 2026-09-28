@@ -11,6 +11,7 @@
 //! Naming follows the OpenTelemetry GenAI Semantic Conventions:
 //! <https://opentelemetry.io/docs/specs/semconv/gen-ai/>
 
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -20,13 +21,23 @@ static METRICS: OnceLock<Metrics> = OnceLock::new();
 pub(crate) const TOOL_LATENCY_BUCKET_UPPER_MS: [u64; 9] =
     [10, 50, 100, 250, 500, 1_000, 5_000, 60_000, i64::MAX as u64];
 
+/// Calls and failures of one tool since process start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ToolCallCounter {
+    pub calls: u64,
+    pub failures: u64,
+}
+
 pub fn global_metrics() -> &'static Metrics {
     METRICS.get_or_init(Metrics::new)
 }
 
 #[derive(Debug)]
 pub struct Metrics {
-    tool_call_consistency: std::sync::Mutex<()>,
+    /// Guards the tool-call counters so a daily snapshot never sees a
+    /// half-applied call, and holds the per-tool counts. Keys are the static
+    /// names of the built-in tool registry, never caller-supplied strings.
+    tool_call_consistency: std::sync::Mutex<BTreeMap<&'static str, ToolCallCounter>>,
     // gen_ai.usage.input_tokens / gen_ai.usage.output_tokens
     pub tokens_input: AtomicU64,
     pub tokens_output: AtomicU64,
@@ -58,7 +69,7 @@ pub struct Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self {
-            tool_call_consistency: std::sync::Mutex::new(()),
+            tool_call_consistency: std::sync::Mutex::new(BTreeMap::new()),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             tokens_saved: AtomicU64::new(0),
@@ -88,10 +99,30 @@ impl Metrics {
     }
 
     pub fn record_tool_call(&self, latency_us: u64, success: bool) {
-        let _guard = self
+        let guard = self
             .tool_call_consistency
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.record_tool_call_locked(latency_us, success);
+        drop(guard);
+    }
+
+    /// Record a call of a built-in tool: the totals and the tool's own counter
+    /// move together under one lock.
+    pub fn record_named_tool_call(&self, tool: &'static str, latency_us: u64, success: bool) {
+        let mut per_tool = self
+            .tool_call_consistency
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.record_tool_call_locked(latency_us, success);
+        let counter = per_tool.entry(tool).or_default();
+        counter.calls = counter.calls.saturating_add(1);
+        if !success {
+            counter.failures = counter.failures.saturating_add(1);
+        }
+    }
+
+    fn record_tool_call_locked(&self, latency_us: u64, success: bool) {
         self.tool_calls_total.fetch_add(1, Ordering::Relaxed);
         self.tool_call_latency_sum_us
             .fetch_add(latency_us, Ordering::Relaxed);
@@ -197,11 +228,12 @@ impl Metrics {
     }
 
     pub(crate) fn daily_telemetry_snapshot(&self) -> DailyTelemetrySnapshot {
-        let _guard = self
+        let per_tool = self
             .tool_call_consistency
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         DailyTelemetrySnapshot {
+            per_tool: per_tool.clone(),
             tool_calls: self.tool_calls_total.load(Ordering::Relaxed),
             tool_failures: self.tool_calls_error.load(Ordering::Relaxed),
             tool_latency_buckets: std::array::from_fn(|index| {
@@ -268,6 +300,7 @@ pub(crate) struct DailyTelemetrySnapshot {
     pub tool_failures: u64,
     pub tool_latency_buckets: [u64; TOOL_LATENCY_BUCKET_UPPER_MS.len()],
     pub session_uptime_secs: u64,
+    pub per_tool: BTreeMap<&'static str, ToolCallCounter>,
 }
 
 /// Point-in-time snapshot of all metrics.
@@ -602,6 +635,32 @@ mod tests {
         assert_eq!(snap.tool_calls_total, 2);
         assert_eq!(snap.tool_calls_error, 1);
         assert!(snap.tool_call_avg_latency_ms > 0.0);
+    }
+
+    #[test]
+    fn named_tool_call_moves_totals_and_per_tool_counter_together() {
+        let m = Metrics::new();
+        m.record_named_tool_call("ctx_read", 1_000, true);
+        m.record_named_tool_call("ctx_read", 2_000, false);
+        m.record_named_tool_call("ctx_shell", 3_000, true);
+
+        let snap = m.daily_telemetry_snapshot();
+        assert_eq!(snap.tool_calls, 3);
+        assert_eq!(snap.tool_failures, 1);
+        assert_eq!(
+            snap.per_tool.get("ctx_read"),
+            Some(&ToolCallCounter {
+                calls: 2,
+                failures: 1
+            })
+        );
+        assert_eq!(
+            snap.per_tool.get("ctx_shell"),
+            Some(&ToolCallCounter {
+                calls: 1,
+                failures: 0
+            })
+        );
     }
 
     #[test]

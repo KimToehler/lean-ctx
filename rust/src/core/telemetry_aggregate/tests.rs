@@ -165,11 +165,16 @@ fn malformed_identity_is_rejected_before_send() {
 #[serial_test::serial]
 fn prepare_is_two_phase_and_preview_does_not_advance_state() {
     let _iso = crate::core::data_dir::isolated_data_dir();
+    // A fresh state has no baseline, so the first batch carries every failure
+    // earlier tests left in this process's global counter.
+    let prior_failures = crate::core::telemetry::global_metrics()
+        .daily_telemetry_snapshot()
+        .tool_failures;
     crate::core::telemetry::global_metrics().record_tool_call(2_000, true);
 
     let preview = preview_daily_batch().expect("preview");
     assert!(!state_path().expect("state path").exists());
-    assert_eq!(tool_counts(&preview).1, 0);
+    assert_eq!(tool_counts(&preview).1, prior_failures);
 
     let pending = prepare_daily_batch().expect("prepare");
     crate::core::telemetry::global_metrics().record_tool_call(4_000, false);
@@ -924,4 +929,129 @@ fn stale_sidecar_discards_sync_but_requeues_setup_after_identity_change() {
     assert_eq!(autopilot_fallback_counts(&current), None);
     assert_eq!(occurrence_count(&current, "checkout_started"), None);
     assert_eq!(error_count(&current, ErrorCategory::Internal), None);
+}
+
+fn tool_call_counts(batch: &TelemetryBatchV2) -> Vec<(String, u64, u64)> {
+    batch
+        .events
+        .iter()
+        .find_map(|envelope| match &envelope.event {
+            TelemetryEventV2::ToolCallAggregate(metrics) => Some(
+                metrics
+                    .tools
+                    .iter()
+                    .map(|entry| (entry.tool.clone(), entry.calls, entry.failures))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn counters(entries: &[(&str, u64, u64)]) -> BTreeMap<String, ToolCounterCheckpoint> {
+    entries
+        .iter()
+        .map(|(tool, calls, failures)| {
+            (
+                (*tool).to_string(),
+                ToolCounterCheckpoint {
+                    calls: *calls,
+                    failures: *failures,
+                },
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn tool_call_deltas_subtract_the_baseline_and_drop_invalid_names() {
+    let observed = counters(&[
+        ("ctx_read", 10, 3),
+        ("ctx_shell", 4, 0),
+        ("ctx_tree", 2, 0),
+        ("Bad Name", 9, 0),
+    ]);
+    let baseline = counters(&[("ctx_read", 7, 1), ("ctx_tree", 2, 0)]);
+    let deltas: Vec<_> = tool_call_deltas(&observed, &baseline)
+        .into_iter()
+        .map(|entry| (entry.tool, entry.calls, entry.failures))
+        .collect();
+    assert_eq!(
+        deltas,
+        vec![
+            ("ctx_read".to_string(), 3, 2),
+            ("ctx_shell".to_string(), 4, 0)
+        ]
+    );
+}
+
+#[test]
+fn tool_call_deltas_keep_the_most_called_tools_past_the_entry_cap() {
+    let observed: BTreeMap<_, _> = (0..MAX_TOOL_ENTRIES + 5)
+        .map(|index| {
+            (
+                format!("tool_{index:04}"),
+                ToolCounterCheckpoint {
+                    calls: index as u64 + 1,
+                    failures: 0,
+                },
+            )
+        })
+        .collect();
+    let deltas = tool_call_deltas(&observed, &BTreeMap::new());
+    assert_eq!(deltas.len(), MAX_TOOL_ENTRIES);
+    assert!(deltas.iter().all(|entry| entry.calls > 5));
+    ToolCallMetrics { tools: deltas }
+        .validate()
+        .expect("capped deltas satisfy the contract");
+}
+
+#[test]
+fn checkpoint_written_before_per_tool_counting_still_loads() {
+    let legacy = r#"{"tool_calls":3,"tool_failures":1,"tool_latency_buckets":[1,1,1,0,0,0,0,0,0],"session_uptime_secs":60}"#;
+    let checkpoint: CounterCheckpoint = serde_json::from_str(legacy).expect("legacy checkpoint");
+    assert!(checkpoint.tools.is_empty());
+    assert_eq!(checkpoint.tool_calls, 3);
+}
+
+#[test]
+#[serial_test::serial]
+fn daily_batch_carries_one_setup_profile() {
+    let _iso = crate::core::data_dir::isolated_data_dir();
+    let batch = preview_daily_batch().expect("preview");
+    let profiles: Vec<_> = batch
+        .events
+        .iter()
+        .filter_map(|envelope| match &envelope.event {
+            TelemetryEventV2::SetupProfile(metrics) => Some(*metrics),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(profiles, vec![setup_profile()]);
+    batch.validate().expect("valid batch");
+}
+
+#[test]
+#[serial_test::serial]
+fn acknowledged_batch_resets_the_per_tool_baseline() {
+    let _iso = crate::core::data_dir::isolated_data_dir();
+    let metrics = crate::core::telemetry::global_metrics();
+    metrics.record_named_tool_call("telemetry_probe_tool", 1_000, true);
+    let first = prepare_daily_batch().expect("prepare");
+    assert!(
+        tool_call_counts(&first)
+            .iter()
+            .any(|(tool, _, _)| tool == "telemetry_probe_tool")
+    );
+    acknowledge_daily_batch(&first).expect("acknowledge");
+
+    metrics.record_named_tool_call("telemetry_probe_tool", 1_000, false);
+    metrics.record_named_tool_call("telemetry_probe_tool", 1_000, true);
+    let next = preview_daily_batch().expect("next preview");
+    let probe: Vec<_> = tool_call_counts(&next)
+        .into_iter()
+        .filter(|(tool, _, _)| tool == "telemetry_probe_tool")
+        .collect();
+    assert_eq!(probe, vec![("telemetry_probe_tool".to_string(), 2, 1)]);
+    next.validate().expect("valid batch");
 }

@@ -241,7 +241,7 @@ impl Session {
             std::time::Duration::from_millis(timeout_ms),
             true,
         );
-        let exit_code = output.status.code().unwrap_or(1);
+        let exit_code = crate::shell::exit_status::exit_code(output.status);
         let mut raw_output = String::from_utf8_lossy(&output.stdout).into_owned();
         raw_output.push_str(&String::from_utf8_lossy(&output.stderr));
         let original_tokens = crate::core::tokens::count_tokens(&raw_output);

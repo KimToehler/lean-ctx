@@ -415,6 +415,41 @@ fn claude_settings_hooks_emit_override_verbatim_and_stay_idempotent() {
     crate::test_env::remove_var("LEAN_CTX_HOOK_BINARY");
 }
 
+/// #1879: with `[setup] manage_hooks = false` the MCP-start refresh must leave a
+/// hand-curated settings.json byte-identical; with the default it still heals.
+#[test]
+fn refresh_respects_manage_hooks_opt_out() {
+    let iso = crate::core::data_dir::isolated_data_dir();
+    let home = tempfile::tempdir().unwrap();
+    let settings_path = home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    let curated = r#"{"hooks":{"PreToolUse":[{"matcher":"Read","hooks":[{"type":"command","command":"lean-ctx hook redirect"}]}]},"permissions":{"allow":[]}}"#;
+    std::fs::write(&settings_path, curated).unwrap();
+    let config_path = iso.path().join("config.toml");
+
+    let old_home = std::env::var("HOME").ok();
+    crate::test_env::set_var("HOME", home.path());
+
+    std::fs::write(&config_path, "[setup]\nmanage_hooks = false\n").unwrap();
+    refresh_installed_hooks();
+    let opted_out = std::fs::read_to_string(&settings_path).unwrap();
+
+    std::fs::write(&config_path, "[setup]\nmanage_hooks = true\n").unwrap();
+    refresh_installed_hooks();
+    let managed = std::fs::read_to_string(&settings_path).unwrap();
+
+    match old_home {
+        Some(h) => crate::test_env::set_var("HOME", h),
+        None => crate::test_env::remove_var("HOME"),
+    }
+
+    assert_eq!(opted_out, curated, "opt-out must not touch settings.json");
+    assert!(
+        managed.contains("hook rewrite"),
+        "default still refreshes: {managed}"
+    );
+}
+
 /// The value status line (3.10.3) must reach installs that already exist: the
 /// update/MCP-start refresh used to rewrite hooks only, so it never appeared.
 #[test]

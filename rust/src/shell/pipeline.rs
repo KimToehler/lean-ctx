@@ -131,7 +131,7 @@ pub(super) fn exec_buffered(
     let output = wait_with_limits(child, max_bytes, timeout, isolate);
 
     let duration_ms = start.elapsed().as_millis();
-    let exit_code = output.status.code().unwrap_or(1);
+    let exit_code = super::exit_status::exit_code(output.status);
     let stdout =
         super::platform::resolve_carriage_returns(&super::platform::decode_output(&output.stdout));
     let stderr =

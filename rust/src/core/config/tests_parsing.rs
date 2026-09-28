@@ -370,6 +370,7 @@ mod setup_config_tests {
             auto_inject_rules: Some(true),
             auto_inject_skills: Some(true),
             auto_update_mcp: true,
+            manage_hooks: true,
         };
         assert!(cfg.should_inject_rules());
         assert!(cfg.should_inject_skills());
@@ -381,6 +382,7 @@ mod setup_config_tests {
             auto_inject_rules: Some(false),
             auto_inject_skills: Some(false),
             auto_update_mcp: true,
+            manage_hooks: true,
         };
         assert!(!cfg.should_inject_rules());
         assert!(!cfg.should_inject_skills());
@@ -392,6 +394,15 @@ mod setup_config_tests {
         assert!(cfg.setup.auto_inject_rules.is_none());
         assert!(cfg.setup.auto_inject_skills.is_none());
         assert!(cfg.setup.auto_update_mcp);
+        assert!(cfg.setup.manage_hooks);
+    }
+
+    #[test]
+    fn manage_hooks_opt_out_parses() {
+        // #1879: the only switch that stops MCP start from rewriting agent hook config.
+        let cfg: Config = toml::from_str("[setup]\nmanage_hooks = false\n").unwrap();
+        assert!(!cfg.setup.manage_hooks);
+        assert!(cfg.setup.auto_update_mcp, "other setup keys keep defaults");
     }
 
     #[test]
@@ -442,6 +453,7 @@ mod setup_config_tests {
                 auto_inject_rules: Some(true),
                 auto_inject_skills: Some(false),
                 auto_update_mcp: true,
+                manage_hooks: true,
             },
             ..Config::default()
         };

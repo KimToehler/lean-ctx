@@ -1183,7 +1183,7 @@ fn passthrough(command: &str) -> ! {
     cmd.arg(&flag).arg(command);
     shell::reentry::mark_child(&mut cmd);
     shell::platform::apply_utf8_locale(&mut cmd);
-    let status = cmd.status().map_or(127, |s| s.code().unwrap_or(1));
+    let status = cmd.status().map_or(127, shell::exit_status::exit_code);
     std::process::exit(status);
 }
 

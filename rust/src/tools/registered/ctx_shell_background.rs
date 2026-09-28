@@ -92,7 +92,7 @@ pub(super) fn format_background_state(
                 BackgroundJobState::Failed
             };
             let head = format!("[background:{id} {}, exit {exit_code}]", state.as_str());
-            let footer = (exit_code != 0).then(|| format!("[exit:{exit_code}]"));
+            let footer = crate::shell::exit_status::exit_marker(exit_code);
             (
                 output.clone(),
                 ShellOutcome::Background(BackgroundShellOutcome {

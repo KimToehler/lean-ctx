@@ -3,6 +3,7 @@ use super::super::{
     mcp_server_quiet_mode, resolve_binary_path_for_bash, resolve_hook_command_binary,
     shell_quoted_binary, write_file, write_wrapper_file,
 };
+use super::claude_delegation::ensure_bash_rewrite_hook;
 use super::shared::remove_all_blocks;
 
 pub(crate) fn install_claude_hook_with_mode(global: bool, mode: HookMode) {
@@ -579,7 +580,7 @@ fn ensure_read_dedup_hook(
 /// Commands are rendered as `<binary> hook <action>`, where `<binary>` is either a bare
 /// `lean-ctx` (when it is on `PATH`) or an absolute path (when it is not). The action token
 /// is therefore the only path-independent way to recognise a lean-ctx hook.
-fn lean_ctx_action_token(command: &str) -> &str {
+pub(super) fn lean_ctx_action_token(command: &str) -> &str {
     match command.rfind(" hook ") {
         Some(i) => command[i + 1..].trim_end(),
         None => command.trim_end(),
@@ -589,7 +590,7 @@ fn lean_ctx_action_token(command: &str) -> &str {
 /// True if `hook` is a lean-ctx command hook for `action`, regardless of how the binary path
 /// was rendered (bare `lean-ctx` vs an absolute path) and including the legacy script form
 /// (`…/lean-ctx-rewrite.sh`) written by pre-3.x installs.
-fn is_lean_ctx_command_for(hook: &serde_json::Value, action: &str) -> bool {
+pub(super) fn is_lean_ctx_command_for(hook: &serde_json::Value, action: &str) -> bool {
     if hook.get("type").and_then(|t| t.as_str()) != Some("command") {
         return false;
     }
@@ -599,8 +600,13 @@ fn is_lean_ctx_command_for(hook: &serde_json::Value, action: &str) -> bool {
     if !cmd.contains("lean-ctx") {
         return false;
     }
-    if cmd.trim_end().ends_with(action) {
-        return true;
+    // Only `<lean-ctx binary> hook <action>` is ours. A user wrapper that merely *mentions*
+    // lean-ctx (`redact-wrap lean-ctx hook rewrite`) ends with the same action but must never
+    // be stripped (#1879).
+    if let Some(program) = cmd.trim_end().strip_suffix(action) {
+        if let Some(program) = program.strip_suffix(' ') {
+            return is_lean_ctx_program(program);
+        }
     }
     let legacy = if action.ends_with("rewrite") {
         "lean-ctx-rewrite"
@@ -612,18 +618,23 @@ fn is_lean_ctx_command_for(hook: &serde_json::Value, action: &str) -> bool {
     cmd.contains(legacy)
 }
 
-/// Ensure exactly one lean-ctx hook for `command`'s action exists under `matcher`.
-///
-/// Earlier versions deduped on the *full* command string, but `resolve_binary_path()` renders
-/// the binary as a bare `lean-ctx` (on `PATH`) or an absolute path (off `PATH`), so the
-/// rendering flips between `install` and `update` and the exact-string compare missed the
-/// existing hook — appending a duplicate on every run. We now strip every stale lean-ctx hook
-/// for this action (any path, any matcher group, including legacy `.sh` hooks) and re-add a
-/// single fresh one. This is idempotent across re-runs *and* self-heals settings files already
-/// duplicated by older versions, while leaving any non-lean-ctx hooks untouched.
-fn ensure_command_hook(pre_arr: &mut Vec<serde_json::Value>, matcher: &str, command: &str) {
-    let action = lean_ctx_action_token(command);
+/// True if `program` (the part of a hook command before ` hook <action>`) is the lean-ctx
+/// binary: a bare `lean-ctx`, any path to it (quoted or not, with spaces, `.exe`, `$HOME/…`
+/// portable forms), the configured `hook_binary` override verbatim, or the binary path the
+/// installer currently renders (covers renamed binaries, which would otherwise be re-added on
+/// every refresh).
+fn is_lean_ctx_program(program: &str) -> bool {
+    let program = program.trim().trim_matches(|c| c == '"' || c == '\'');
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    name.eq_ignore_ascii_case("lean-ctx")
+        || name.eq_ignore_ascii_case("lean-ctx.exe")
+        || crate::core::portable_binary::hook_binary_override().is_some_and(|o| o == program)
+        || crate::hooks::resolve_binary_path() == program
+}
 
+/// Remove every lean-ctx hook for `action` (any path, any matcher group), dropping groups
+/// left empty. Non-lean-ctx hooks are untouched.
+pub(super) fn strip_lean_ctx_hooks(pre_arr: &mut Vec<serde_json::Value>, action: &str) {
     for group in pre_arr.iter_mut() {
         if let Some(hooks) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
             hooks.retain(|h| !is_lean_ctx_command_for(h, action));
@@ -634,6 +645,23 @@ fn ensure_command_hook(pre_arr: &mut Vec<serde_json::Value>, matcher: &str, comm
             .and_then(|h| h.as_array())
             .is_none_or(|hooks| !hooks.is_empty())
     });
+}
+
+/// Ensure exactly one lean-ctx hook for `command`'s action exists under `matcher`.
+///
+/// Earlier versions deduped on the *full* command string, but `resolve_binary_path()` renders
+/// the binary as a bare `lean-ctx` (on `PATH`) or an absolute path (off `PATH`), so the
+/// rendering flips between `install` and `update` and the exact-string compare missed the
+/// existing hook — appending a duplicate on every run. We now strip every stale lean-ctx hook
+/// for this action (any path, any matcher group, including legacy `.sh` hooks) and re-add a
+/// single fresh one. This is idempotent across re-runs *and* self-heals settings files already
+/// duplicated by older versions, while leaving any non-lean-ctx hooks untouched.
+pub(super) fn ensure_command_hook(
+    pre_arr: &mut Vec<serde_json::Value>,
+    matcher: &str,
+    command: &str,
+) {
+    strip_lean_ctx_hooks(pre_arr, lean_ctx_action_token(command));
 
     let desired = serde_json::json!({ "type": "command", "command": command });
     if let Some(group) = pre_arr
@@ -769,7 +797,7 @@ pub(crate) fn install_claude_hook_config(home: &std::path::Path) {
                     .entry("PreToolUse".to_string())
                     .or_insert_with(|| serde_json::json!([]));
                 if let Some(pre_arr) = pre.as_array_mut() {
-                    ensure_command_hook(pre_arr, bash_matcher, &rewrite_cmd);
+                    ensure_bash_rewrite_hook(pre_arr, bash_matcher, &rewrite_cmd, home);
                     ensure_command_hook(pre_arr, REDIRECT_MATCHER, &redirect_cmd);
                 }
                 ensure_claude_observe_hooks(hooks_obj, &observe_cmd);
@@ -843,7 +871,10 @@ pub(crate) fn install_claude_project_hooks(cwd: &std::path::Path) {
                     .entry("PreToolUse".to_string())
                     .or_insert_with(|| serde_json::json!([]));
                 if let Some(pre_arr) = pre.as_array_mut() {
-                    ensure_command_hook(pre_arr, bash_matcher, &rewrite_cmd);
+                    // Project wrappers reference `~/…` scripts too; without a resolvable home
+                    // only inline delegation is detected.
+                    let home = crate::core::home::resolve_home_dir().unwrap_or_default();
+                    ensure_bash_rewrite_hook(pre_arr, bash_matcher, &rewrite_cmd, &home);
                     ensure_command_hook(pre_arr, REDIRECT_MATCHER, &redirect_cmd);
                 }
                 ensure_claude_project_observe_hooks(hooks_obj, &observe_cmd);
@@ -1023,6 +1054,65 @@ mod tests {
         assert_eq!(
             commands_for(&pre, "hook redirect"),
             ["lean-ctx hook redirect"]
+        );
+    }
+
+    fn all_commands(pre: &[serde_json::Value]) -> Vec<String> {
+        pre.iter()
+            .filter_map(|g| g.get("hooks").and_then(|h| h.as_array()))
+            .flatten()
+            .filter_map(|h| h.get("command").and_then(|c| c.as_str()).map(String::from))
+            .collect()
+    }
+
+    fn cmd_hook(command: &str) -> serde_json::Value {
+        json!({ "type": "command", "command": command })
+    }
+
+    #[test]
+    fn own_hook_recognised_in_every_rendering() {
+        for cmd in [
+            "lean-ctx hook rewrite",
+            "/Users/x/.local/bin/lean-ctx hook rewrite",
+            "\"/Users/First Last/bin/lean-ctx\" hook rewrite",
+            "C:\\Program Files\\lean-ctx\\lean-ctx.exe hook rewrite",
+            "$HOME/.cargo/bin/lean-ctx hook rewrite",
+            "/home/u/.claude/hooks/lean-ctx-rewrite.sh",
+        ] {
+            assert!(
+                is_lean_ctx_command_for(&cmd_hook(cmd), "hook rewrite"),
+                "not recognised as own: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_wrapper_mentioning_lean_ctx_is_not_own() {
+        // #1879: a wrapper that ends in the same action is the user's, not ours.
+        for cmd in [
+            "redact-wrap lean-ctx hook rewrite",
+            "sh -c 'lean-ctx hook rewrite'",
+            "/opt/bin/not-lean-ctx hook rewrite",
+        ] {
+            assert!(
+                !is_lean_ctx_command_for(&cmd_hook(cmd), "hook rewrite"),
+                "user wrapper treated as own: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_wrapper_survives_install() {
+        let mut pre = vec![json!({
+            "matcher": "Bash",
+            "hooks": [cmd_hook("redact-wrap lean-ctx hook rewrite")]
+        })];
+        ensure_command_hook(&mut pre, BASH, "lean-ctx hook rewrite");
+        assert!(
+            all_commands(&pre)
+                .iter()
+                .any(|c| c == "redact-wrap lean-ctx hook rewrite"),
+            "user wrapper stripped: {pre:?}"
         );
     }
 

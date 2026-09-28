@@ -94,3 +94,21 @@ fn is_shell_error(outcome: &crate::server::tool_trait::ShellOutcome, output: &st
         crate::server::tool_trait::ShellOutcome::Background(outcome) => outcome.is_error,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::tool_trait::ShellOutcome;
+
+    /// #1881: a signal-terminated command with output used to surface as
+    /// Exit(1) and pass the grep-style exception as a success. As 128+signal
+    /// it is an error regardless of output.
+    #[test]
+    fn signal_termination_with_output_is_error() {
+        let r = finalize_call_result(
+            "partial output\n[exit:143 — SIGTERM]",
+            Some(ShellOutcome::Exit(143)),
+        );
+        assert_eq!(r.is_error, Some(true));
+    }
+}

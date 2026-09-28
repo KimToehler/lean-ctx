@@ -103,7 +103,7 @@ pub(crate) fn execute_sandboxed(
     Ok((
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
-        output.status.code().unwrap_or(1),
+        crate::shell::exit_status::exit_code(output.status),
     ))
 }
 

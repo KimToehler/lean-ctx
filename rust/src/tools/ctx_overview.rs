@@ -583,7 +583,8 @@ fn partial_overview(project_root: &str) -> String {
 
     // Shallow tree (depth 2) of what's on disk right now.
     let (tree, _) = crate::tools::ctx_tree::handle(project_root, 2, false, true);
-    if !tree.trim().is_empty() {
+    // A tree error ("ERROR: … does not exist …") is not structure; skip it.
+    if !tree.trim().is_empty() && !tree.trim_start().starts_with("ERROR:") {
         out.push("STRUCTURE (depth 2):".to_string());
         out.push(tree);
         out.push(String::new());
@@ -633,6 +634,14 @@ fn detected_markers(project_root: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_overview_omits_tree_errors() {
+        let missing = tempfile::tempdir().unwrap().path().join("gone");
+        let out = partial_overview(&missing.to_string_lossy());
+        assert!(!out.contains("STRUCTURE"), "{out}");
+        assert!(!out.contains("ERROR:"), "{out}");
+    }
 
     #[test]
     fn truncate_start_ascii() {

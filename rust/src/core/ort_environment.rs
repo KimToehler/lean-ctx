@@ -6,16 +6,22 @@
 //!
 //! # Search order
 //!
-//! 1. `ORT_DYLIB_PATH` env var (resolved relative to the executable directory)
-//! 2. The lean-ctx managed runtime (`lean-ctx embeddings provision`, GH #732)
-//!    — version-matched to this build's `ort` API level by construction
-//! 3. Nix profile paths (Linux):
+//! 1. `ORT_DYLIB_PATH` env var — the library file or the directory holding it
+//!    (a relative path is resolved against the executable directory first)
+//! 2. Nix profile paths (Linux):
 //!    - `/run/current-system/sw/lib/` (system profile)
 //!    - `/etc/profiles/per-user/$USER/lib/` (NixOS Home Manager per-user)
 //!    - `~/.nix-profile/lib/` (legacy user profile symlink)
-//! 4. Well-known system directories per platform, including the active
+//! 3. Well-known system directories per platform, including the active
 //!    `HOMEBREW_PREFIX` and the standard Homebrew/Linuxbrew lib dirs
-//! 5. `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`
+//! 4. `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`
+//! 5. The `onnxruntime` / `onnxruntime-gpu` pip wheels
+//!    (`site-packages/onnxruntime/capi/`) in the active venv or conda env,
+//!    `PYTHONPATH`, the user site and the system site dirs
+//!
+//! Every directory accepts the exact platform name (`libonnxruntime.so`) and a
+//! versioned variant (`libonnxruntime.so.1.24.1`, `libonnxruntime.1.24.1.dylib`),
+//! which is what pip wheels and Debian runtime packages ship.
 //!
 //! If no copy is found, [`ensure_ort_env`] returns an eager error — session
 //! creation hangs rather than failing, so we fail fast.
@@ -76,6 +82,14 @@ fn init_ort(eps: &[ExecutionProviderDispatch]) -> anyhow::Result<()> {
 
 pub(crate) fn resolved_ort_dylib_path() -> anyhow::Result<PathBuf> {
     resolve_ort_dylib()
+}
+
+/// Resolve and version-check the runtime without initialising ORT
+/// (`lean-ctx embeddings status`).
+pub(crate) fn check_ort_runtime() -> anyhow::Result<PathBuf> {
+    let path = resolve_ort_dylib()?;
+    validate_ort_dylib_version(&path)?;
+    Ok(path)
 }
 
 type OrtGetApiBase = unsafe extern "C" fn() -> *const OrtApiBase;
@@ -146,53 +160,203 @@ fn dylib_filename() -> &'static str {
 fn resolve_ort_dylib() -> anyhow::Result<PathBuf> {
     let name = dylib_filename();
 
-    // 1. ORT_DYLIB_PATH env var (resolved relative to exe dir)
+    // 1. ORT_DYLIB_PATH env var: a file or a directory (relative → exe dir)
     if let Ok(p) = std::env::var("ORT_DYLIB_PATH") {
-        let path = PathBuf::from(&p);
-        if path.is_relative() {
-            let rel_to_exe = || -> Option<PathBuf> {
-                let exe = std::env::current_exe().ok()?;
-                let dir = exe.parent()?;
-                let abs = dir.join(&path);
-                abs.is_file().then_some(abs)
-            };
-            if let Some(abs) = rel_to_exe() {
-                return Ok(abs);
-            }
-        }
-        if path.is_file() {
-            return Ok(path);
-        }
-        anyhow::bail!("ORT_DYLIB_PATH={p} set but file does not exist");
+        return resolve_env_override(&p, name);
     }
 
-    // 3. Nix profile paths (Linux) — system & user profiles always point to
+    // 2. Nix profile paths (Linux) — system & user profiles always point to
     //    the currently activated version.
     #[cfg(target_os = "linux")]
     if let Some(found) = nix_profile_search(name) {
         return Ok(found);
     }
 
-    // 4. Well-known system paths (per platform)
+    // 3. Well-known system paths (per platform)
     if let Some(found) = well_known_paths(name) {
         return Ok(found);
     }
 
-    // 5. LD_LIBRARY_PATH / DYLD_LIBRARY_PATH
+    // 4. LD_LIBRARY_PATH / DYLD_LIBRARY_PATH
     if let Some(found) = lib_path_search(name) {
         return Ok(found);
     }
 
+    // 5. pip wheels (`onnxruntime`, `onnxruntime-gpu`) in site-packages
+    if let Some(found) = python_site_packages_search(name) {
+        return Ok(found);
+    }
+
     anyhow::bail!(
-        "libonnxruntime not found.\n\
-         Managed:  lean-ctx embeddings provision  (official CPU runtime, sha256-pinned)\n\
-         Or set ORT_DYLIB_PATH=<path> to point to the shared library.\n\
-         Install:  pip install onnxruntime  (Python bundles the .so)\n\
-         NixOS:    nix-shell -p onnxruntime\n\
+        "libonnxruntime not found (lean-ctx needs ONNX Runtime >= 1.{minor}).\n\
+         Set ORT_DYLIB_PATH to the library file or the directory that contains it.\n\
+         MCP servers read it from the \"env\" block of your editor's MCP config, not from your shell.\n\
+         pip:      pip install onnxruntime  (library: <site-packages>/onnxruntime/capi/)\n\
          Homebrew: brew install onnxruntime\n\
-         Searched: ORT_DYLIB_PATH, managed runtime dir, Nix store, \
-         well-known system dirs, LD_LIBRARY_PATH/DYLD_LIBRARY_PATH"
+         NixOS:    nix-shell -p onnxruntime\n\
+         GPU:      x86_64 Linux: lean-ctx enable-gpu + pip install onnxruntime-gpu, \
+         then LEAN_CTX_ORT_EXECUTION_PROVIDER=gpu\n\
+         Searched: ORT_DYLIB_PATH, Nix profiles, well-known system dirs, \
+         LD_LIBRARY_PATH/DYLD_LIBRARY_PATH, Python site-packages (venv, conda, PYTHONPATH, user, system)",
+        minor = ort::MINOR_VERSION,
     )
+}
+
+/// Resolve an explicit `ORT_DYLIB_PATH`. Accepts the library file or a
+/// directory containing it; a relative value is tried against the executable
+/// directory first. An explicit override never falls through to the search.
+fn resolve_env_override(value: &str, name: &str) -> anyhow::Result<PathBuf> {
+    let path = PathBuf::from(value);
+    let mut candidates = Vec::with_capacity(2);
+    if path.is_relative()
+        && let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    {
+        candidates.push(dir.join(&path));
+    }
+    candidates.push(path);
+
+    for candidate in &candidates {
+        if candidate.is_file() {
+            return Ok(candidate.clone());
+        }
+        if candidate.is_dir()
+            && let Some(found) = find_in_dir(candidate, name)
+        {
+            return Ok(found);
+        }
+    }
+    if candidates.iter().any(|c| c.is_dir()) {
+        anyhow::bail!(
+            "ORT_DYLIB_PATH={value} is a directory without {name} (or a versioned variant); \
+             point it at the ONNX Runtime library file"
+        );
+    }
+    anyhow::bail!("ORT_DYLIB_PATH={value} set but file does not exist")
+}
+
+/// Find the ONNX Runtime library in `dir`: the exact platform name first, then
+/// the highest versioned variant (`libonnxruntime.so.1.24.1`,
+/// `libonnxruntime.1.24.1.dylib`) as shipped by pip wheels and distro packages.
+fn find_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
+    let exact = dir.join(name);
+    if exact.is_file() {
+        return Some(exact);
+    }
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let file = entry.file_name();
+            let version = versioned_dylib_version(file.to_str()?, name)?;
+            let path = entry.path();
+            path.is_file().then_some((version, path))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, path)| path)
+}
+
+/// Version components of a versioned variant of `name`, e.g.
+/// `libonnxruntime.so.1.24.1` / `libonnxruntime.1.24.1.dylib` → `[1, 24, 1]`.
+/// `None` for anything else, including sibling provider libraries.
+fn versioned_dylib_version(file: &str, name: &str) -> Option<Vec<u32>> {
+    let suffix_style = file.strip_prefix(name).and_then(|r| r.strip_prefix('.'));
+    let version = suffix_style.or_else(|| {
+        let (stem, ext) = name.rsplit_once('.')?;
+        file.strip_prefix(stem)?
+            .strip_prefix('.')?
+            .strip_suffix(ext)?
+            .strip_suffix('.')
+    })?;
+    if version.is_empty() {
+        return None;
+    }
+    version.split('.').map(|part| part.parse().ok()).collect()
+}
+
+/// Search the `onnxruntime/capi/` directory of every known Python
+/// site-packages location. Only directory listings — no interpreter is run.
+fn python_site_packages_search(name: &str) -> Option<PathBuf> {
+    python_site_packages_dirs()
+        .into_iter()
+        .find_map(|sp| find_in_dir(&sp.join("onnxruntime").join("capi"), name))
+}
+
+/// Candidate site-packages directories, most specific first: the active
+/// venv / conda env, `PYTHONPATH`, the user site, then system prefixes.
+fn python_site_packages_dirs() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for var in ["VIRTUAL_ENV", "CONDA_PREFIX"] {
+        if let Some(prefix) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+            push_prefix_site_packages(&mut out, Path::new(&prefix));
+        }
+    }
+    if let Some(paths) = std::env::var_os("PYTHONPATH") {
+        out.extend(std::env::split_paths(&paths).filter(|p| p.is_absolute()));
+    }
+    if let Some(home) = dirs::home_dir() {
+        push_prefix_site_packages(&mut out, &home.join(".local"));
+        #[cfg(target_os = "macos")]
+        for version in subdirs_with_prefix(&home.join("Library").join("Python"), "3.") {
+            out.push(version.join("lib").join("python").join("site-packages"));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            for version in subdirs_with_prefix(&Path::new(&appdata).join("Python"), "Python3") {
+                out.push(version.join("site-packages"));
+            }
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let programs = Path::new(&local).join("Programs").join("Python");
+            for version in subdirs_with_prefix(&programs, "Python3") {
+                out.push(version.join("Lib").join("site-packages"));
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    for prefix in ["/usr/local", "/usr", "/opt/homebrew"] {
+        push_prefix_site_packages(&mut out, Path::new(prefix));
+    }
+    out
+}
+
+/// site-packages dirs under an installation prefix: `Lib/site-packages`
+/// (Windows venv) and `lib/python3*/{site,dist}-packages` (POSIX).
+fn push_prefix_site_packages(dirs: &mut Vec<PathBuf>, prefix: &Path) {
+    dirs.push(prefix.join("Lib").join("site-packages"));
+    for python in subdirs_with_prefix(&prefix.join("lib"), "python3") {
+        dirs.push(python.join("site-packages"));
+        dirs.push(python.join("dist-packages"));
+    }
+}
+
+/// Subdirectories of `dir` whose name starts with `prefix`, newest version
+/// first (`python3.12` before `python3.9`).
+fn subdirs_with_prefix(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(Vec<u32>, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let file = entry.file_name();
+            let rest = file.to_str()?.strip_prefix(prefix)?.to_string();
+            let path = entry.path();
+            path.is_dir().then(|| (numeric_key(&rest), path))
+        })
+        .collect();
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().map(|(_, path)| path).collect()
+}
+
+/// Numeric components of a version-like string (`".12"` → `[12]`).
+fn numeric_key(text: &str) -> Vec<u32> {
+    text.split(|c: char| !c.is_ascii_digit())
+        .filter_map(|part| part.parse().ok())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -207,16 +371,9 @@ fn resolve_ort_dylib() -> anyhow::Result<PathBuf> {
 /// currently activated package versions — these are always authoritative.
 #[cfg(target_os = "linux")]
 fn nix_profile_search(name: &str) -> Option<PathBuf> {
-    let home = dirs::home_dir();
-    let user_profile = home
-        .as_ref()
-        .map(|h| h.join(".nix-profile").join("lib").join(name));
-    let candidates = [
-        Some(Path::new("/run/current-system/sw/lib").join(name)),
-        nix_per_user_lib(Path::new("/etc/profiles/per-user"), name),
-        user_profile,
-    ];
-    candidates.into_iter().flatten().find(|c| c.is_file())
+    find_in_dir(Path::new("/run/current-system/sw/lib"), name)
+        .or_else(|| nix_per_user_lib(Path::new("/etc/profiles/per-user"), name))
+        .or_else(|| find_in_dir(&dirs::home_dir()?.join(".nix-profile").join("lib"), name))
 }
 
 /// Resolve the per-user Nix profile library path from `$USER`.
@@ -230,8 +387,7 @@ fn nix_per_user_lib(base: &Path, name: &str) -> Option<PathBuf> {
     if user.is_empty() || user.contains('/') || user.contains('\0') || user.contains("..") {
         return None;
     }
-    let candidate = base.join(&user).join("lib").join(name);
-    candidate.is_file().then_some(candidate)
+    find_in_dir(&base.join(&user).join("lib"), name)
 }
 
 /// Check well-known system directories for `libonnxruntime`.
@@ -285,21 +441,14 @@ fn well_known_paths(name: &str) -> Option<PathBuf> {
     // locate the dylib regardless of platform or custom prefix — Apple Silicon
     // (/opt/homebrew), Intel (/usr/local) and Linuxbrew
     // (/home/linuxbrew/.linuxbrew) all symlink `onnxruntime` into <prefix>/lib.
-    if let Ok(prefix) = std::env::var("HOMEBREW_PREFIX") {
-        let candidate = Path::new(&prefix).join("lib").join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
+    if let Ok(prefix) = std::env::var("HOMEBREW_PREFIX")
+        && let Some(found) = find_in_dir(&Path::new(&prefix).join("lib"), name)
+    {
+        return Some(found);
     }
 
-    for dir in dirs {
-        let candidate = Path::new(dir).join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-
-    None
+    dirs.iter()
+        .find_map(|dir| find_in_dir(Path::new(dir), name))
 }
 
 /// Scan `LD_LIBRARY_PATH` (Linux) or `DYLD_LIBRARY_PATH` (macOS) directories.
@@ -310,13 +459,7 @@ fn lib_path_search(name: &str) -> Option<PathBuf> {
         "LD_LIBRARY_PATH"
     };
     let path = std::env::var(var).ok()?;
-    for segment in std::env::split_paths(&path) {
-        let candidate = segment.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    std::env::split_paths(&path).find_map(|segment| find_in_dir(&segment, name))
 }
 
 #[cfg(test)]
@@ -375,6 +518,132 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
 
         assert_eq!(found, Some(libdir.join(name)));
+    }
+
+    /// A pip-wheel style versioned filename for the current platform.
+    fn versioned_name(version: &str) -> String {
+        let name = dylib_filename();
+        if cfg!(target_os = "linux") {
+            format!("{name}.{version}")
+        } else {
+            let (stem, ext) = name.rsplit_once('.').unwrap();
+            format!("{stem}.{version}.{ext}")
+        }
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lc-ort-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn versioned_dylib_names_are_recognized() {
+        let v = |file: &str, name: &str| versioned_dylib_version(file, name);
+        assert_eq!(
+            v("libonnxruntime.so.1.24.1", "libonnxruntime.so"),
+            Some(vec![1, 24, 1])
+        );
+        assert_eq!(
+            v("libonnxruntime.1.24.1.dylib", "libonnxruntime.dylib"),
+            Some(vec![1, 24, 1])
+        );
+        assert_eq!(v("libonnxruntime.so", "libonnxruntime.so"), None);
+        assert_eq!(v("libonnxruntime.so.", "libonnxruntime.so"), None);
+        assert_eq!(v("libonnxruntime.so.1.x", "libonnxruntime.so"), None);
+        assert_eq!(
+            v("libonnxruntime_providers_cuda.so", "libonnxruntime.so"),
+            None
+        );
+        assert_eq!(
+            v(
+                "libonnxruntime_providers_shared.1.24.1.dylib",
+                "libonnxruntime.dylib"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn find_in_dir_prefers_exact_then_highest_version() {
+        let dir = scratch_dir("find");
+        let name = dylib_filename();
+        std::fs::write(dir.join(versioned_name("1.9.0")), b"old").unwrap();
+        std::fs::write(dir.join(versioned_name("1.24.1")), b"new").unwrap();
+        assert_eq!(
+            find_in_dir(&dir, name),
+            Some(dir.join(versioned_name("1.24.1")))
+        );
+        std::fs::write(dir.join(name), b"exact").unwrap();
+        assert_eq!(find_in_dir(&dir, name), Some(dir.join(name)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ort_dylib_path_accepts_a_directory() {
+        let _env_lock = crate::core::data_dir::test_env_lock();
+        let dir = scratch_dir("envdir");
+        let lib = dir.join(versioned_name("1.24.1"));
+        std::fs::write(&lib, b"marker").unwrap();
+
+        crate::test_env::set_var("ORT_DYLIB_PATH", dir.to_str().unwrap());
+        let found = resolve_ort_dylib();
+        std::fs::remove_file(&lib).unwrap();
+        let empty = resolve_ort_dylib();
+        crate::test_env::remove_var("ORT_DYLIB_PATH");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(found.unwrap(), lib);
+        let err = empty.unwrap_err().to_string();
+        assert!(err.contains("is a directory"), "{err}");
+    }
+
+    #[test]
+    fn pip_wheel_in_active_venv_is_found() {
+        let _env_lock = crate::core::data_dir::test_env_lock();
+        let venv = scratch_dir("venv");
+        let site = if cfg!(target_os = "windows") {
+            venv.join("Lib").join("site-packages")
+        } else {
+            venv.join("lib").join("python3.12").join("site-packages")
+        };
+        let capi = site.join("onnxruntime").join("capi");
+        std::fs::create_dir_all(&capi).unwrap();
+        let lib = capi.join(versioned_name("1.24.1"));
+        std::fs::write(&lib, b"marker").unwrap();
+
+        crate::test_env::set_var("VIRTUAL_ENV", venv.to_str().unwrap());
+        let found = python_site_packages_search(dylib_filename());
+        crate::test_env::remove_var("VIRTUAL_ENV");
+        std::fs::remove_dir_all(&venv).ok();
+
+        assert_eq!(found, Some(lib));
+    }
+
+    #[test]
+    fn subdirs_with_prefix_orders_newest_python_first() {
+        let lib = scratch_dir("pyorder");
+        for dir in ["python3.9", "python3.12", "python3", "perl5"] {
+            std::fs::create_dir_all(lib.join(dir)).unwrap();
+        }
+        let found: Vec<_> = subdirs_with_prefix(&lib, "python3")
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        std::fs::remove_dir_all(&lib).ok();
+        assert_eq!(found, ["python3.12", "python3.9", "python3"]);
+    }
+
+    #[test]
+    fn not_found_error_has_no_stale_provision_hint() {
+        let _env_lock = crate::core::data_dir::test_env_lock();
+        crate::test_env::remove_var("ORT_DYLIB_PATH");
+        if let Err(err) = resolve_ort_dylib() {
+            let text = err.to_string();
+            assert!(!text.contains("provision"), "{text}");
+            assert!(text.contains("ORT_DYLIB_PATH"), "{text}");
+        }
     }
 
     #[cfg(target_os = "linux")]

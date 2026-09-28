@@ -3,6 +3,26 @@
 All notable changes to lean-ctx are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed — ONNX Runtime from pip is found
+
+- lean-ctx now finds the `onnxruntime` / `onnxruntime-gpu` pip wheels on its
+  own (`site-packages/onnxruntime/capi/` in the active venv or conda env,
+  `PYTHONPATH`, the user site and the system site dirs). No interpreter is run.
+- `ORT_DYLIB_PATH` accepts the directory that holds the library, not only the
+  file.
+- Versioned library names (`libonnxruntime.so.1.24.1`,
+  `libonnxruntime.1.24.1.dylib`) are recognized in every searched directory,
+  including Debian runtime packages.
+- The "not found" error, the index-build failure and `lean-ctx help` no longer
+  point at the removed `lean-ctx embeddings provision`. The error names the
+  required ONNX Runtime version, where pip puts the library, that MCP servers
+  read `ORT_DYLIB_PATH` from the editor's MCP `env` block, and the GPU path
+  (`lean-ctx enable-gpu` + `LEAN_CTX_ORT_EXECUTION_PROVIDER=gpu`).
+- `lean-ctx embeddings status` shows which runtime is used, its version check
+  and the execution-provider policy.
+
 ## [3.10.5] — 2026-09-27
 
 ### Fixed — MCP configs survive package-manager updates

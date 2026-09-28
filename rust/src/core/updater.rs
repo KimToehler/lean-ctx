@@ -369,7 +369,7 @@ fn run_with_mode(args: &[String], mode: UpdateMode) {
         println!("  \x1b[2mBinary: {}\x1b[0m", current_exe.display());
         if mode == UpdateMode::EnableGpu {
             println!(
-                "  \x1b[2mSet ORT_DYLIB_PATH to your ONNX Runtime GPU lib; lean-ctx auto-detects it.\x1b[0m"
+                "  \x1b[2mNext: pip install onnxruntime-gpu (found automatically) or set ORT_DYLIB_PATH to its lib/dir.\x1b[0m"
             );
         }
     }

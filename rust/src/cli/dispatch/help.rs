@@ -166,7 +166,7 @@ COMMANDS:
     pack --pr                      PR Context Pack (changed files, impact, tests, artifacts)
     snapshot create|list|show|verify|restore|publish|import  Context Time Machine: git-anchored, signed snapshots; replay, resume + share
     index <status|build|build-full|watch> [--force]  Codebase index utilities
-    embeddings <status|provision>  Local ONNX Runtime for semantic embeddings (official CPU build, sha256-pinned)
+    embeddings status              Show the ONNX Runtime used for semantic embeddings (ORT_DYLIB_PATH)
     cep                            CEP report (compression metrics, cache, modes, trends)
     verify-cache [path] [--json]   Inspect local session-cache re-read behavior
     prove [--format table|json|markdown] [--output FILE]  Generate Decision Loop evidence report

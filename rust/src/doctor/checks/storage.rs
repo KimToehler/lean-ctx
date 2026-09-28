@@ -172,18 +172,74 @@ pub(crate) fn bm25_cache_health_outcome() -> Outcome {
         ),
     }
 }
-/// Runtime status of the semantic (BM25) index for the active project: whether
-/// it is idle/building/ready/failed, how long the last build took, and — crucially
+/// Doctor lines for the active project's search indexes: the BM25 index and,
+/// separately, the dense semantic (embedding) index.
+///
+/// #1887: the BM25 status used to be labelled "Semantic index", so doctor said
+/// "ready" while `index status` (which reads the dense vectors) said "not
+/// built". Both lines now name what they measure, and the semantic line reads
+/// the same on-disk state as `index status`.
+pub(crate) fn search_index_outcomes() -> Vec<Outcome> {
+    let Some(project_root) =
+        crate::core::session::SessionState::load_latest().and_then(|s| s.project_root)
+    else {
+        return Vec::new();
+    };
+    let disk = crate::core::index_orchestrator::disk_status_for_semantic(&project_root);
+    vec![
+        bm25_index_outcome(&project_root),
+        dense_index_outcome(&disk, cfg!(feature = "embeddings")),
+    ]
+}
+
+/// Dense (embedding) index status from the vectors on disk.
+fn dense_index_outcome(
+    disk: &crate::core::index_orchestrator::DiskStatus,
+    embeddings_build: bool,
+) -> Outcome {
+    if !embeddings_build {
+        return Outcome {
+            ok: true,
+            line: format!(
+                "{BOLD}Semantic index{RST}  {DIM}not available (built without embeddings){RST}"
+            ),
+        };
+    }
+    if !disk.exists {
+        return Outcome {
+            ok: true,
+            line: format!(
+                "{BOLD}Semantic index{RST}  {DIM}not built (run: lean-ctx index build-semantic; runtime: lean-ctx embeddings status){RST}"
+            ),
+        };
+    }
+    let mut details = Vec::new();
+    if let Some(b) = disk.size_bytes {
+        details.push(format!("{:.1} MB", b as f64 / 1_048_576.0));
+    }
+    if let Some(ref t) = disk.modified_at {
+        details.push(format!("built {t}"));
+    }
+    let details = if details.is_empty() {
+        String::new()
+    } else {
+        format!(" {DIM}({}){RST}", details.join(", "))
+    };
+    Outcome {
+        ok: true,
+        line: format!("{BOLD}Semantic index{RST}  {GREEN}ready{RST}{details}"),
+    }
+}
+
+/// Runtime status of the BM25 index for the active project: whether it is
+/// idle/building/ready/failed, how long the last build took, and — crucially
 /// — *why* it might be stuck (e.g. "indexed but NOT persisted: too large").
 ///
-/// This answers issue #249: users had no way to tell whether the semantic index
-/// was working, how fast it was, or why it kept "warming up" forever.
-pub(crate) fn semantic_index_outcome() -> Option<Outcome> {
-    let session = crate::core::session::SessionState::load_latest()?;
-    let project_root = session.project_root?;
-
-    let summary = crate::core::index_orchestrator::bm25_summary(&project_root);
-    let disk = crate::core::index_orchestrator::disk_status(&project_root);
+/// This answers issue #249: users had no way to tell whether the index was
+/// working, how fast it was, or why it kept "warming up" forever.
+fn bm25_index_outcome(project_root: &str) -> Outcome {
+    let summary = crate::core::index_orchestrator::bm25_summary(project_root);
+    let disk = crate::core::index_orchestrator::disk_status(project_root);
     let persisted = if disk.bm25_index.exists {
         match disk.bm25_index.size_bytes {
             Some(b) => format!("persisted {:.1} MB", b as f64 / 1_048_576.0),
@@ -199,11 +255,11 @@ pub(crate) fn semantic_index_outcome() -> Option<Outcome> {
         None => String::new(),
     };
 
-    let outcome = match summary.state {
+    match summary.state {
         "failed" => Outcome {
             ok: false,
             line: format!(
-                "{BOLD}Semantic index{RST}  {RED}FAILED{RST}: {}  {DIM}(run: lean-ctx index build-semantic){RST}",
+                "{BOLD}BM25 index{RST}  {RED}FAILED{RST}: {}  {DIM}(run: lean-ctx index build){RST}",
                 summary
                     .last_error
                     .or(summary.note)
@@ -212,7 +268,7 @@ pub(crate) fn semantic_index_outcome() -> Option<Outcome> {
         },
         "building" => Outcome {
             ok: true,
-            line: format!("{BOLD}Semantic index{RST}  {YELLOW}building{timing}{RST}"),
+            line: format!("{BOLD}BM25 index{RST}  {YELLOW}building{timing}{RST}"),
         },
         _ if summary
             .note
@@ -222,7 +278,7 @@ pub(crate) fn semantic_index_outcome() -> Option<Outcome> {
             Outcome {
                 ok: false,
                 line: format!(
-                    "{BOLD}Semantic index{RST}  {YELLOW}rebuilds every cold start{RST}: {}",
+                    "{BOLD}BM25 index{RST}  {YELLOW}rebuilds every cold start{RST}: {}",
                     summary.note.unwrap_or_default()
                 ),
             }
@@ -230,25 +286,25 @@ pub(crate) fn semantic_index_outcome() -> Option<Outcome> {
         "ready" => Outcome {
             ok: true,
             line: format!(
-                "{BOLD}Semantic index{RST}  {GREEN}ready{RST} {DIM}({persisted}{timing}){RST}"
+                "{BOLD}BM25 index{RST}  {GREEN}ready{RST} {DIM}({persisted}{timing}){RST}"
             ),
         },
         // idle: never asked to build this session — report disk state only.
         _ if disk.bm25_index.exists => Outcome {
             ok: true,
             line: format!(
-                "{BOLD}Semantic index{RST}  {GREEN}ready{RST} {DIM}({persisted}, on disk){RST}"
+                "{BOLD}BM25 index{RST}  {GREEN}ready{RST} {DIM}({persisted}, on disk){RST}"
             ),
         },
         _ => Outcome {
             ok: true,
             line: format!(
-                "{BOLD}Semantic index{RST}  {DIM}not built yet (builds on first semantic search/compose){RST}"
+                "{BOLD}BM25 index{RST}  {DIM}not built yet (builds on first search/compose){RST}"
             ),
         },
-    };
-    Some(outcome)
+    }
 }
+
 pub(crate) fn archive_footprint_outcome() -> Outcome {
     let bytes = crate::core::archive_fts::db_size_bytes();
     let cap_mb = std::env::var("LEAN_CTX_ARCHIVE_DB_MAX_MB")
@@ -632,5 +688,34 @@ pub(crate) fn capacity_hint(critical: bool) -> &'static str {
         "over cap — eviction is behind. Run `lean-ctx knowledge consolidate --all` to compact project memory now, or raise the relevant memory.* cap"
     } else {
         "at/near cap is healthy by design — lean-ctx self-curates (write-time dedup #970, hourly cluster-compaction #971, 90-day prune #972). Raise a cap only if recall quality drops (memory.*)"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dense_index_outcome;
+    use crate::core::index_orchestrator::DiskStatus;
+
+    #[test]
+    fn dense_index_outcome_reports_vectors_not_bm25() {
+        let absent = dense_index_outcome(&DiskStatus::default(), true);
+        assert!(absent.line.contains("Semantic index"));
+        assert!(absent.line.contains("not built"));
+        assert!(absent.line.contains("build-semantic"));
+
+        let built = DiskStatus {
+            exists: true,
+            size_bytes: Some(3 * 1_048_576),
+            file_count: None,
+            modified_at: Some("2026-09-28 10:00".into()),
+        };
+        let ready = dense_index_outcome(&built, true);
+        assert!(ready.ok);
+        assert!(ready.line.contains("ready"));
+        assert!(ready.line.contains("3.0 MB"));
+        assert!(ready.line.contains("built 2026-09-28 10:00"));
+
+        let no_feature = dense_index_outcome(&built, false);
+        assert!(no_feature.line.contains("built without embeddings"));
     }
 }

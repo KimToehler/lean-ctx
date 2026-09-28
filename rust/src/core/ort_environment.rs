@@ -66,8 +66,8 @@ fn init_ort(eps: &[ExecutionProviderDispatch]) -> anyhow::Result<()> {
     let path = resolved_ort_dylib_path()?;
 
     tracing::debug!("Loading libonnxruntime from {}", path.display());
-    validate_ort_dylib_version(&path)?;
-    tracing::debug!("Calling ort::init_from");
+    let version = validate_ort_dylib_version(&path)?;
+    tracing::debug!("ONNX Runtime {version}; calling ort::init_from");
     let init = ort::init_from(&path)
         .map_err(|e| anyhow::anyhow!("ort::init_from({}) failed: {e}", path.display()))?;
     tracing::debug!("ort::init_from returned; committing ONNX Runtime environment");
@@ -85,11 +85,12 @@ pub(crate) fn resolved_ort_dylib_path() -> anyhow::Result<PathBuf> {
 }
 
 /// Resolve and version-check the runtime without initialising ORT
-/// (`lean-ctx embeddings status`).
-pub(crate) fn check_ort_runtime() -> anyhow::Result<PathBuf> {
+/// (`lean-ctx embeddings status`). Returns the library path and the version
+/// string the runtime reports about itself (#1887).
+pub(crate) fn check_ort_runtime() -> anyhow::Result<(PathBuf, String)> {
     let path = resolve_ort_dylib()?;
-    validate_ort_dylib_version(&path)?;
-    Ok(path)
+    let version = validate_ort_dylib_version(&path)?;
+    Ok((path, version))
 }
 
 type OrtGetApiBase = unsafe extern "C" fn() -> *const OrtApiBase;
@@ -101,7 +102,7 @@ struct OrtApiBase {
     get_version_string: GetVersionString,
 }
 
-fn validate_ort_dylib_version(path: &Path) -> anyhow::Result<()> {
+fn validate_ort_dylib_version(path: &Path) -> anyhow::Result<String> {
     // SAFETY: the path was resolved by resolve_ort_dylib; loading a shared
     // library executes its initializers, which is the accepted risk of any
     // dlopen-based ORT discovery (same trust boundary as ort::init_from).
@@ -124,8 +125,11 @@ fn validate_ort_dylib_version(path: &Path) -> anyhow::Result<()> {
     // OrtApiBase; GetVersionString takes no arguments.
     let version = unsafe { ((*base).get_version_string)() };
     // SAFETY: GetVersionString returns a static NUL-terminated C string owned
-    // by the runtime for the lifetime of the library.
-    let version = unsafe { CStr::from_ptr(version) }.to_string_lossy();
+    // by the runtime for the lifetime of the library; copied out before `lib`
+    // is dropped.
+    let version = unsafe { CStr::from_ptr(version) }
+        .to_string_lossy()
+        .into_owned();
     let minor = version
         .split('.')
         .nth(1)
@@ -137,7 +141,7 @@ fn validate_ort_dylib_version(path: &Path) -> anyhow::Result<()> {
         path.display(),
         ort::MINOR_VERSION,
     );
-    Ok(())
+    Ok(version)
 }
 
 // ---------------------------------------------------------------------------

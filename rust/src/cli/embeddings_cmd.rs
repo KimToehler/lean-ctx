@@ -17,9 +17,10 @@ pub(crate) fn cmd_embeddings(rest: &[String]) {
 #[cfg(feature = "embeddings")]
 fn status() {
     let source = ort_dylib_path_source(std::env::var_os("ORT_DYLIB_PATH").as_deref());
+    let model = model_status_line();
     match crate::core::ort_environment::check_ort_runtime() {
-        Ok(path) => {
-            println!("ONNX Runtime: {}", path.display());
+        Ok((path, version)) => {
+            println!("ONNX Runtime: {} (version {version})", path.display());
             println!("{source}");
             println!(
                 "{}",
@@ -28,11 +29,39 @@ fn status() {
             if let Some(gpu) = crate::core::ort_execution_providers::gpu_runtime_status() {
                 println!("{gpu}");
             }
+            println!("{model}");
         }
         Err(e) => {
             eprintln!("{e}");
+            eprintln!("{model}");
             std::process::exit(1);
         }
+    }
+}
+
+/// #1887: whether the selected embedding model is on disk, and where.
+#[cfg(feature = "embeddings")]
+fn model_status_line() -> String {
+    use crate::core::embeddings::{EmbeddingEngine, model_registry};
+    let selected = model_registry::resolve_model();
+    let dir = EmbeddingEngine::model_directory().join(selected.storage_dir_name());
+    format_model_status(
+        &selected.config().name,
+        &dir,
+        EmbeddingEngine::is_available(),
+    )
+}
+
+#[cfg(any(feature = "embeddings", test))]
+fn format_model_status(name: &str, dir: &std::path::Path, present: bool) -> String {
+    if present {
+        format!("Embedding model: {name} — present ({})", dir.display())
+    } else {
+        format!(
+            "Embedding model: {name} — not downloaded yet ({}); \
+             `lean-ctx index build-semantic` downloads it",
+            dir.display()
+        )
     }
 }
 
@@ -63,6 +92,17 @@ mod tests {
         let unset = ort_dylib_path_source(None);
         assert!(unset.contains("not set in this process"));
         assert!(unset.contains("MCP config"));
+    }
+
+    #[test]
+    fn model_status_names_model_and_directory() {
+        let dir = std::path::Path::new("/cache/models/minilm");
+        let present = format_model_status("minilm", dir, true);
+        assert!(present.contains("minilm — present"));
+        assert!(present.contains("/cache/models/minilm"));
+        let missing = format_model_status("minilm", dir, false);
+        assert!(missing.contains("not downloaded yet"));
+        assert!(missing.contains("index build-semantic"));
     }
 }
 

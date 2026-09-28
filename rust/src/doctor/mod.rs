@@ -615,11 +615,11 @@ fn run_inner(json: bool) -> u32 {
     let stats_quarantine = stats_quarantine_outcome();
     board.check(&stats_quarantine);
 
-    // 15a) Semantic index runtime status (state/timing/persistence) for the
-    // active project — surfaces a stuck "warming" index (issue #249).
-    let semantic_index = semantic_index_outcome();
-    if let Some(ref check) = semantic_index {
-        board.check(check);
+    // 15a) Search indexes for the active project: the BM25 runtime status
+    // (surfaces a stuck "warming" index, #249) and the dense vector index
+    // on disk — reported separately so neither masquerades as the other (#1887).
+    for check in search_index_outcomes() {
+        board.check(&check);
     }
 
     // 15b) Archive FTS footprint

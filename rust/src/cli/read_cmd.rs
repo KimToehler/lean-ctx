@@ -99,13 +99,16 @@ fn resolve_cli_read_mode(args: &[String]) -> String {
 }
 
 /// Env vars that change how a read is rendered but only exist in the caller's
-/// process — a long-lived daemon never sees them (#1889).
+/// process — a long-lived daemon never sees them (#1889). The daemon path is
+/// Unix-only, so these are too.
+#[cfg(unix)]
 const CALLER_OUTPUT_OVERRIDES: [&str; 3] = [
     "LEAN_CTX_CRP_MODE",
     "LEAN_CTX_COMPRESSION",
     "LEAN_CTX_PROFILE",
 ];
 
+#[cfg(unix)]
 fn has_caller_output_override() -> bool {
     CALLER_OUTPUT_OVERRIDES
         .iter()

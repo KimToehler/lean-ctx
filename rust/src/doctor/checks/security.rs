@@ -275,10 +275,10 @@ pub(crate) fn managed_addon_binaries_outcome() -> Option<Outcome> {
     None
 }
 
-/// Managed ONNX Runtime state (GH #732). Only rendered on embedding-enabled
-/// builds; `None` when the runtime is simply not provisioned (embeddings are
-/// opt-in — a missing optional runtime is not a finding, the provision hint
-/// lives in the embeddings CLI and the resolver error).
+/// Managed ONNX Runtime state (GH #732). The managed runtime was removed, so
+/// this is always `None`: embeddings are opt-in and a missing optional runtime
+/// is not a finding — `lean-ctx embeddings status` and the resolver error
+/// explain how to point `ORT_DYLIB_PATH` at an installed runtime.
 pub(crate) fn managed_ort_outcome() -> Option<Outcome> {
     None
 }

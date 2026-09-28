@@ -373,8 +373,8 @@ fn run_inner(json: bool) -> u32 {
         board.check(&managed_bins);
     }
 
-    // 5b3d) Managed ONNX Runtime (GH #732): present + readable on
-    // embedding-enabled builds. Silent when not provisioned (opt-in).
+    // 5b3d) Managed ONNX Runtime (GH #732). The managed runtime was removed;
+    // stays silent (embeddings are opt-in).
     if let Some(managed_ort) = managed_ort_outcome() {
         board.check(&managed_ort);
     }

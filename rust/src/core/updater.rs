@@ -1,5 +1,8 @@
 use std::io::Read;
 
+mod platform;
+use platform::{gpu_next_steps, gpu_platform_asset_name, platform_asset_name};
+
 const GITHUB_API_RELEASES: &str = "https://api.github.com/repos/yvgude/lean-ctx/releases/latest";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -368,9 +371,9 @@ fn run_with_mode(args: &[String], mode: UpdateMode) {
         }
         println!("  \x1b[2mBinary: {}\x1b[0m", current_exe.display());
         if mode == UpdateMode::EnableGpu {
-            println!(
-                "  \x1b[2mNext: pip install onnxruntime-gpu (found automatically) or set ORT_DYLIB_PATH to its lib/dir.\x1b[0m"
-            );
+            for line in gpu_next_steps(std::env::consts::OS) {
+                println!("  \x1b[2m{line}\x1b[0m");
+            }
         }
     }
 
@@ -1215,83 +1218,6 @@ exit /b 1
 del "%~f0" >nul 2>&1
 "#
     )
-}
-
-fn detect_linux_libc() -> &'static str {
-    let output = std::process::Command::new("ldd").arg("--version").output();
-    if let Ok(out) = output {
-        let text = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let combined = format!("{text}{stderr}");
-        for line in combined.lines() {
-            if let Some(ver) = line.split_whitespace().last() {
-                let parts: Vec<&str> = ver.split('.').collect();
-                if parts.len() == 2
-                    && let (Ok(major), Ok(minor)) =
-                        (parts[0].parse::<u32>(), parts[1].parse::<u32>())
-                {
-                    if major > 2 || (major == 2 && minor >= 35) {
-                        return "gnu";
-                    }
-                    return "musl";
-                }
-            }
-        }
-    }
-    "musl"
-}
-
-fn platform_asset_name() -> String {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-
-    let target = match (os, arch) {
-        ("macos", "aarch64") => "aarch64-apple-darwin".to_string(),
-        ("macos", "x86_64") => "x86_64-apple-darwin".to_string(),
-        ("linux", "x86_64") => {
-            let libc = detect_linux_libc();
-            if current_build_prefers_gpu_asset() && libc == "gnu" {
-                "x86_64-unknown-linux-gnu-cuda".to_string()
-            } else {
-                format!("x86_64-unknown-linux-{libc}")
-            }
-        }
-        ("linux", "aarch64") => format!("aarch64-unknown-linux-{}", detect_linux_libc()),
-        ("windows", "x86_64") => "x86_64-pc-windows-msvc".to_string(),
-        _ => {
-            tracing::error!(
-                "Unsupported platform: {os}/{arch}. Download manually from \
-                https://github.com/yvgude/lean-ctx/releases/latest"
-            );
-            std::process::exit(1);
-        }
-    };
-
-    if os == "windows" {
-        format!("lean-ctx-{target}.zip")
-    } else {
-        format!("lean-ctx-{target}.tar.gz")
-    }
-}
-
-fn gpu_platform_asset_name() -> Result<String, String> {
-    if std::env::consts::OS != "linux" || std::env::consts::ARCH != "x86_64" {
-        return Err(
-            "CUDA binary is currently published for x86_64 GNU/Linux only. Use `lean-ctx update` for the CPU binary or build with --features ort-cuda."
-                .to_string(),
-        );
-    }
-    if detect_linux_libc() != "gnu" {
-        return Err(
-            "CUDA binary requires GNU libc Linux. This system detected musl; use the CPU binary or build with --features ort-cuda."
-                .to_string(),
-        );
-    }
-    Ok("lean-ctx-x86_64-unknown-linux-gnu-cuda.tar.gz".to_string())
-}
-
-fn current_build_prefers_gpu_asset() -> bool {
-    cfg!(feature = "ort-cuda")
 }
 
 #[cfg(test)]

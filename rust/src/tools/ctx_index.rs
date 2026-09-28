@@ -56,6 +56,6 @@ pub fn handle(action: &str, project_root: &Path) -> String {
                     .unwrap_or("semantic index not available".to_string()),
             }
         }
-        _ => "Unknown action. Use: status, build, build-full, build-semantic".to_string(),
+        _ => "Unknown action. Use: status, build, build-full, build-semantic, why".to_string(),
     }
 }

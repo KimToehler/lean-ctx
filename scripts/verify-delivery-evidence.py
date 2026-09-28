@@ -79,6 +79,7 @@ TARGETS = (
     ("x86_64-apple-darwin", "x86_64-apple-darwin", "macos-15-intel"),
     ("aarch64-apple-darwin", "aarch64-apple-darwin", "macos-15"),
     ("x86_64-pc-windows-msvc", "x86_64-pc-windows-msvc", "windows-2025"),
+    ("x86_64-pc-windows-msvc-cuda", "x86_64-pc-windows-msvc", "windows-2025"),
     ("x86_64-pc-windows-gnu", "x86_64-pc-windows-gnu", "windows-2025"),
 )
 PUBLISH_CHANNELS = (

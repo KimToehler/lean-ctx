@@ -5,6 +5,70 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — files in legacy Windows encodings are indexed
+
+- Source files that are not strict UTF-8 were skipped silently by every index:
+  BM25, the semantic index, the graph, and `ctx_search`. Examples are
+  Windows-1252 "ANSI" files from Windows editors and UTF-16 files from
+  Visual Studio and PowerShell. On Windows projects, `ctx_compose` then
+  answered "no match" for code that was on disk. These files are now decoded:
+  - UTF-16 LE/BE by byte-order mark;
+  - valid UTF-8 unchanged, with any UTF-8 BOM stripped;
+  - UTF-8 with a few corrupt bytes decoded lossily;
+  - everything else as Windows-1252, so line numbers stay exact.
+- Binary detection (a NUL byte in the first 8 KiB) no longer rejects UTF-16
+  text. Run `lean-ctx index build` once so the affected files are added.
+
+### Added — `lean-ctx index why <file>`
+
+- Explains whether a file is in the search corpus and, if not, which rule
+  dropped it and how to change that. It covers the full chain: gitignore,
+  vendor and agent directories, walk depth, the lockfile/binary type,
+  built-in and `extra_ignore_patterns`, the `[index]` filter,
+  `bm25_max_files`, the 2 MiB limit, binary content, and minified bundles.
+  The checks reuse the indexer's own rules, so the diagnosis and the actual
+  indexing cannot drift apart. An eligible file shows its detected encoding
+  and whether BM25 has it, with its chunk count and freshness. The command
+  prints JSON with `--json` and exits with 1 when the file is excluded.
+  MCP: `ctx_index action=why path=<file>`.
+
+### Added — GPU embeddings on Windows
+
+- Releases ship a CUDA build for Windows (`lean-ctx-x86_64-pc-windows-msvc-cuda.zip`,
+  PyPI `thinkery-leanctx-engine-cuda` for `win_amd64`). `lean-ctx enable-gpu`
+  installs it on x86_64 Windows as it already did on x86_64 GNU/Linux, and
+  `lean-ctx update` keeps a CUDA build on the CUDA asset.
+- The CUDA 12 / cuDNN 9 libraries are found without `PATH` or
+  `LD_LIBRARY_PATH` changes. When ONNX Runtime's CUDA provider does not load
+  on the first try, lean-ctx preloads them from the pip `nvidia-*` wheels that
+  `pip install "onnxruntime-gpu[cuda,cudnn]"` installs. On Windows it also
+  looks in the CUDA Toolkit (`CUDA_PATH`, `CUDA_PATH_V12_*`) and the cuDNN 9
+  installer (`%ProgramFiles%\NVIDIA\CUDNN\v9.*\bin\12.*`), and loads the
+  provider with its own directory on the DLL search path.
+- On Windows, the CPU-fallback warning lists the missing DLLs (for example
+  `cudnn64_9*.dll`) instead of only `os error 126`. It also gives
+  Windows-specific install steps and warns that a CUDA 13 toolkit alone does
+  not provide the `*64_12.dll` files.
+
+### Improved — clearer ONNX Runtime diagnostics
+
+- The "not found" error says that `ORT_DYLIB_PATH` is not set in this process.
+  It explains that an MCP config `env` block reaches only the MCP server and
+  not terminal commands such as `lean-ctx index build-semantic`. It also shows
+  how to set the variable permanently: a PowerShell user variable on Windows
+  and a shell profile on Linux and macOS. For JSON configs, it shows that a
+  Windows path needs escaped backslashes.
+- A mangled `ORT_DYLIB_PATH` gets a hint that names the cause:
+  - control characters from a single backslash in JSON (`C:\new\…`);
+  - surrounding quotes;
+  - `%VAR%`, `$VAR` or `~`, which are not expanded.
+- `lean-ctx embeddings status` shows whether `ORT_DYLIB_PATH` is set in this
+  process, and on CUDA builds whether the CUDA runtime loads. On CPU-only
+  builds it points at `lean-ctx enable-gpu` when the selected ONNX Runtime has
+  CUDA support.
+- After `lean-ctx enable-gpu`, the next steps are specific to each platform
+  and use `pip install "onnxruntime-gpu[cuda,cudnn]"`.
+
 ### Fixed — ONNX Runtime from pip is found
 
 - lean-ctx now finds the `onnxruntime` / `onnxruntime-gpu` pip wheels on its

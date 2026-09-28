@@ -332,7 +332,7 @@ pub fn handle_filtered(
                 if state.is_some() {
                     crate::core::cache::record_search_content_read(false);
                 }
-                let Ok(text) = std::fs::read_to_string(path) else {
+                let Ok(text) = crate::core::text_decode::read_text(path) else {
                     files_skipped_encoding += 1;
                     continue;
                 };

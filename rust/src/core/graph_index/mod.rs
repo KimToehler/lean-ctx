@@ -682,7 +682,7 @@ fn source_content_changed_since_index(index: &ProjectIndex, root_abs: &str) -> b
             // Too many candidates to verify cheaply — assume stale.
             return true;
         }
-        match std::fs::read_to_string(path) {
+        match crate::core::text_decode::read_text(path) {
             // Bytes unchanged despite a newer mtime → not a real change.
             Ok(content) if compute_hash(&content) == file_entry.hash => {}
             // Edited content, or no longer readable as it was at scan time.
@@ -1029,7 +1029,7 @@ fn process_scan_file(
     if crate::core::memory_guard::abort_requested() {
         return None;
     }
-    let content = std::fs::read_to_string(file_path).ok()?;
+    let content = crate::core::text_decode::read_text(file_path).ok()?;
     let hash = compute_hash(&content);
 
     // Unchanged file with a prior entry: reuse verbatim (no re-parse). Clone

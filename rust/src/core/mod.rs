@@ -510,6 +510,7 @@ pub mod tdd_schema;
 pub mod telemetry;
 pub(crate) mod telemetry_ledger;
 pub mod terse;
+pub(crate) mod text_decode;
 pub mod theme;
 pub mod threshold_learning;
 pub mod tokenizer_translation_driver;

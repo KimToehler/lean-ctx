@@ -181,7 +181,7 @@ fn resolve_file_edges(
         {
             return out;
         }
-        match std::fs::read_to_string(&abs_path) {
+        match crate::core::text_decode::read_text(&abs_path) {
             Ok(c) => std::borrow::Cow::Owned(c),
             Err(_) => return out,
         }
@@ -320,7 +320,7 @@ fn collect_rust_mod_edges_cached(
         std::borrow::Cow::Borrowed(cached.as_str())
     } else {
         let full_path = Path::new(&index.project_root).join(file);
-        match std::fs::read_to_string(&full_path) {
+        match crate::core::text_decode::read_text(&full_path) {
             Ok(c) => std::borrow::Cow::Owned(c),
             Err(_) => return,
         }
@@ -421,7 +421,7 @@ fn collect_barrel_edges_cached(
         std::borrow::Cow::Borrowed(cached.as_str())
     } else {
         let full_path = Path::new(&index.project_root).join(file);
-        match std::fs::read_to_string(&full_path) {
+        match crate::core::text_decode::read_text(&full_path) {
             Ok(c) => std::borrow::Cow::Owned(c),
             Err(_) => return,
         }

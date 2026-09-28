@@ -187,18 +187,49 @@ fn resolve_ort_dylib() -> anyhow::Result<PathBuf> {
         return Ok(found);
     }
 
-    anyhow::bail!(
-        "libonnxruntime not found (lean-ctx needs ONNX Runtime >= 1.{minor}).\n\
-         Set ORT_DYLIB_PATH to the library file or the directory that contains it.\n\
-         MCP servers read it from the \"env\" block of your editor's MCP config, not from your shell.\n\
-         pip:      pip install onnxruntime  (library: <site-packages>/onnxruntime/capi/)\n\
-         Homebrew: brew install onnxruntime\n\
-         NixOS:    nix-shell -p onnxruntime\n\
-         GPU:      x86_64 Linux: lean-ctx enable-gpu + pip install onnxruntime-gpu, \
-         then LEAN_CTX_ORT_EXECUTION_PROVIDER=gpu\n\
+    anyhow::bail!("{}", not_found_message(cfg!(target_os = "windows")))
+}
+
+/// Error shown when no ONNX Runtime was found. Reaching it means
+/// `ORT_DYLIB_PATH` is unset in *this* process — the most common cause is a
+/// value that lives only in an MCP config `env` block, which the MCP server
+/// sees but a terminal command (`lean-ctx index build-semantic`) does not.
+fn not_found_message(windows: bool) -> String {
+    let minor = ort::MINOR_VERSION;
+    let (name, set_var, json_example, install) = if windows {
+        (
+            "onnxruntime.dll",
+            "PowerShell (persistent, then open a new terminal):\n    \
+             [Environment]::SetEnvironmentVariable('ORT_DYLIB_PATH', 'C:\\path\\to\\onnxruntime.dll', 'User')",
+            "\"ORT_DYLIB_PATH\": \"C:\\\\path\\\\to\\\\onnxruntime.dll\"  (JSON needs \\\\ or /, a single \\ is invalid)",
+            "pip:      pip install onnxruntime  (library: <site-packages>\\onnxruntime\\capi\\, found automatically)\n  \
+             GPU:      lean-ctx enable-gpu + pip install \"onnxruntime-gpu[cuda,cudnn]\", \
+             then LEAN_CTX_ORT_EXECUTION_PROVIDER=gpu",
+        )
+    } else {
+        (
+            "libonnxruntime",
+            "shell:    export ORT_DYLIB_PATH=/path/to/libonnxruntime.so  (add it to your shell profile)",
+            "\"ORT_DYLIB_PATH\": \"/path/to/libonnxruntime.so\"",
+            "pip:      pip install onnxruntime  (library: <site-packages>/onnxruntime/capi/, found automatically)\n  \
+             Homebrew: brew install onnxruntime\n  \
+             NixOS:    nix-shell -p onnxruntime\n  \
+             GPU:      x86_64 Linux: lean-ctx enable-gpu + pip install \"onnxruntime-gpu[cuda,cudnn]\", \
+             then LEAN_CTX_ORT_EXECUTION_PROVIDER=gpu",
+        )
+    };
+    format!(
+        "{name} not found (lean-ctx needs ONNX Runtime >= 1.{minor}).\n\
+         ORT_DYLIB_PATH is not set in this process. Point it at the library file or its directory:\n  \
+         {set_var}\n  \
+         MCP config \"env\" block: {json_example}\n  \
+         The MCP \"env\" block only reaches the MCP server your editor starts — terminal commands \
+         such as `lean-ctx index build-semantic` need the variable in your shell/user environment too.\n\
+         Install:\n  \
+         {install}\n\
          Searched: ORT_DYLIB_PATH, Nix profiles, well-known system dirs, \
-         LD_LIBRARY_PATH/DYLD_LIBRARY_PATH, Python site-packages (venv, conda, PYTHONPATH, user, system)",
-        minor = ort::MINOR_VERSION,
+         LD_LIBRARY_PATH/DYLD_LIBRARY_PATH, Python site-packages (venv, conda, PYTHONPATH, user, system)\n\
+         Check with: lean-ctx embeddings status"
     )
 }
 
@@ -233,7 +264,25 @@ fn resolve_env_override(value: &str, name: &str) -> anyhow::Result<PathBuf> {
              point it at the ONNX Runtime library file"
         );
     }
-    anyhow::bail!("ORT_DYLIB_PATH={value} set but file does not exist")
+    anyhow::bail!(
+        "ORT_DYLIB_PATH={value:?} set but file does not exist{}",
+        override_hint(value)
+    )
+}
+
+/// Explain the usual ways an `ORT_DYLIB_PATH` value gets mangled.
+fn override_hint(value: &str) -> &'static str {
+    if value.chars().any(char::is_control) {
+        // "C:\new\onnxruntime.dll" in JSON: \n and friends become control chars.
+        "\nThe value contains control characters — in JSON configs write Windows paths with \
+         \\\\ (C:\\\\...\\\\onnxruntime.dll) or forward slashes (C:/.../onnxruntime.dll)."
+    } else if value.starts_with(['"', '\'']) || value.ends_with(['"', '\'']) {
+        "\nThe value includes quote characters — set the bare path without quotes."
+    } else if value.contains('%') || value.contains('$') || value.starts_with('~') {
+        "\nEnvironment variables and ~ are not expanded here — use the absolute path."
+    } else {
+        ""
+    }
 }
 
 /// Find the ONNX Runtime library in `dir`: the exact platform name first, then
@@ -285,7 +334,7 @@ fn python_site_packages_search(name: &str) -> Option<PathBuf> {
 
 /// Candidate site-packages directories, most specific first: the active
 /// venv / conda env, `PYTHONPATH`, the user site, then system prefixes.
-fn python_site_packages_dirs() -> Vec<PathBuf> {
+pub(crate) fn python_site_packages_dirs() -> Vec<PathBuf> {
     let mut out = Vec::new();
     for var in ["VIRTUAL_ENV", "CONDA_PREFIX"] {
         if let Some(prefix) = std::env::var_os(var).filter(|v| !v.is_empty()) {
@@ -476,6 +525,34 @@ mod tests {
         } else if cfg!(target_os = "windows") {
             assert_eq!(name, "onnxruntime.dll");
         }
+    }
+
+    #[test]
+    fn not_found_message_explains_env_scope_per_platform() {
+        let windows = not_found_message(true);
+        assert!(windows.starts_with("onnxruntime.dll not found"));
+        assert!(windows.contains("ORT_DYLIB_PATH is not set in this process"));
+        assert!(windows.contains("SetEnvironmentVariable('ORT_DYLIB_PATH'"));
+        assert!(windows.contains(r#""C:\\path\\to\\onnxruntime.dll""#));
+        assert!(windows.contains("only reaches the MCP server"));
+        assert!(windows.contains("onnxruntime-gpu[cuda,cudnn]"));
+        assert!(!windows.contains("brew install"));
+
+        let unix = not_found_message(false);
+        assert!(unix.contains("export ORT_DYLIB_PATH="));
+        assert!(unix.contains("brew install onnxruntime"));
+        assert!(unix.contains("only reaches the MCP server"));
+        assert!(!unix.contains("SetEnvironmentVariable"));
+    }
+
+    #[test]
+    fn override_hint_names_the_mangling() {
+        // "C:\new\onnxruntime.dll" decoded from JSON turns \n into a newline.
+        assert!(override_hint("C:\new\\onnxruntime.dll").contains("control characters"));
+        assert!(override_hint("\"C:\\ort\\onnxruntime.dll\"").contains("quote"));
+        assert!(override_hint("%USERPROFILE%\\ort\\onnxruntime.dll").contains("not expanded"));
+        assert!(override_hint("~/ort/libonnxruntime.so").contains("not expanded"));
+        assert_eq!(override_hint("C:\\ort\\onnxruntime.dll"), "");
     }
 
     #[test]

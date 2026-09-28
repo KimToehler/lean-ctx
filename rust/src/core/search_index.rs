@@ -169,7 +169,7 @@ impl SearchIndex {
         // so a change that happens to cancel under addition is still detected.
         // Folded over the *eligible-by-stat* universe — before the read below —
         // so the stat-only re-walk in [`corpus_signature`] reproduces it exactly,
-        // including files that turn out to be non-UTF-8 (counted, never indexed).
+        // including files that turn out to be binary (counted, never indexed).
         let mut sig_sum: u64 = 0;
         let mut file_count: usize = 0;
         let mut aborted = false;
@@ -187,14 +187,14 @@ impl SearchIndex {
                 // copy if a prior `ctx_search`/build already read this file, else
                 // read it now and publish it so the upcoming `ctx_search` verify
                 // pass is an in-memory hit instead of a second disk read. Mirrors
-                // ctx_search: a non-UTF-8 file is never searchable, so it is skipped
+                // ctx_search: a binary file is never searchable, so it is skipped
                 // for trigrams (but already folded into the signature above).
                 let content: std::sync::Arc<str> = if let Some(cached) =
                     state.and_then(|s| crate::core::content_cache::get(path, s))
                 {
                     cached
                 } else {
-                    let Ok(text) = std::fs::read_to_string(path) else {
+                    let Ok(text) = crate::core::text_decode::read_text(path) else {
                         return true;
                     };
                     let arc: std::sync::Arc<str> = std::sync::Arc::from(text);

@@ -546,7 +546,7 @@ pub(super) fn handle_full_with_auto_delta(
     let prof = crate::core::profiles::active_profile();
     let force_full = no_deg
         || (prof.read.default_mode_effective() == "full"
-            && prof.compression.crp_mode_effective() == "off");
+            && prof.compression.crp_mode.as_deref() == Some("off"));
 
     let old_content = cache
         .get(path)

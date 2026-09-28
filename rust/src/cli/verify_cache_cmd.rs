@@ -106,7 +106,7 @@ fn run_probe(path: &str) -> ProbeOutcome {
     let prof = crate::core::profiles::active_profile();
     let force_full = no_degrade
         || (prof.read.default_mode_effective() == "full"
-            && prof.compression.crp_mode_effective() == "off");
+            && prof.compression.crp_mode.as_deref() == Some("off"));
     let policy = crate::server::compaction_sync::effective_cache_policy();
     let stub_enabled = policy != "safe" && policy != "off" && !force_full;
     let disabled_reason = if stub_enabled {

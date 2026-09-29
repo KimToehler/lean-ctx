@@ -143,7 +143,7 @@ pub fn preview_daily_batch() -> Result<TelemetryBatchV2, String> {
     ensure_parent(&path)?;
     let lock = open_state_lock(&path)?;
     lock.try_lock_exclusive().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::WouldBlock {
+        if super::file_lock::is_contended(&error) {
             "exact telemetry preview unavailable while a send is in progress".to_string()
         } else {
             format!("cannot lock telemetry aggregate state for preview: {error}")

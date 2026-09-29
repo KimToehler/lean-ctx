@@ -150,6 +150,7 @@ All `std::sync::Mutex` unless noted otherwise.
 | L113 | `JOURNAL_LOCK` | `core/journal.rs:14` | `LazyLock<Mutex<()>>` | Serializes journal rotation and writes; held while acquiring only the journal's independent OS file lock, never nested with another Rust static lock |
 | L114 | `PENDING` | `core/security_events.rs:177` | `Mutex<SecurityCounts>` | Security-event counters pending for the session snapshot; leaf lock, taken after the audit-trail write returns, never nested |
 | L115 | `CURRENT_SESSION` | `core/value/mod.rs:17` | `RwLock<Option<String>>` | Session id committed into ledger and security-event hashes; leaf lock, never nested |
+| L116 | `FOLDED` | `core/telemetry_aggregate.rs:600` | `OnceLock<Mutex<HashMap<PathBuf, CounterCheckpoint>>>` | Per-process tool counters already folded into each telemetry one-shot sidecar; taken under the one-shot OS file lock but never nested with another Rust static lock, guard dropped before any I/O |
 
 ### Test / Environment Locks (serialise env-var mutations)
 

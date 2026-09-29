@@ -90,7 +90,7 @@ lean-ctx maintains a marker-delimited block in `~/.claude/CLAUDE.md`:
 
 When the `ctx_*` MCP tools are listed in this session, prefer them over native equivalents:
 - `ctx_read` instead of `Read` / `cat` for exploration (cached, 10 modes, re-reads ~13 tokens)
-- `ctx_shell` instead of `bash` / `Shell` (95+ compression patterns)
+- `ctx_shell` instead of `bash` / `Shell` (85+ compression patterns)
 - `ctx_search` instead of `Grep` / `rg` (compact results)
 - `ctx_tree` instead of `ls` / `find` (compact directory maps)
 - Edits: `ctx_read(mode="anchored")` → `ctx_patch` (line+hash anchors, never echo old text; `op=create` for new files). `ctx_edit` (str_replace) is the legacy power-profile fallback.

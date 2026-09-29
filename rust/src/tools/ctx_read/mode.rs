@@ -119,6 +119,28 @@ pub(crate) enum ReadMode {
     Density(f64),
 }
 
+/// One spelling per [`ReadMode`] variant family — what the docs count as
+/// "read modes" (#1896). `mode_families_cover_every_variant` keeps it exact.
+#[cfg(test)]
+pub(crate) const MODE_FAMILIES: &[&str] = &[
+    "full",
+    "full-compact",
+    "anchored",
+    "raw",
+    "signatures",
+    "map",
+    "aggressive",
+    "entropy",
+    "cognitive",
+    "mdl",
+    "task",
+    "reference",
+    "auto",
+    "diff",
+    "lines:5-10",
+    "density:0.40",
+];
+
 /// Error returned when a string is not a recognised [`ReadMode`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParseModeError {

@@ -4,4 +4,4 @@ expression: compressed
 ---
 main
 unstaged: ~src/main.rs ~src/lib.rs
-untracked: new_file.rs no changes added to commit (use "git add" and/or "git commit -a")
+untracked: new_file.rs

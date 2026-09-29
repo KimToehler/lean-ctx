@@ -37,6 +37,20 @@ pub fn compress(command: &str, output: &str) -> Option<String> {
 }
 
 fn compress_install(output: &str) -> String {
+    let summary = compress_install_summary(output);
+    // Tail lines already shown verbatim must not be repeated.
+    let advisories: Vec<String> = super::npm::install_advisories(output)
+        .into_iter()
+        .filter(|a| !summary.lines().any(|l| l.trim() == a))
+        .collect();
+    if advisories.is_empty() {
+        summary
+    } else {
+        format!("{summary}\n{}", advisories.join("\n"))
+    }
+}
+
+fn compress_install_summary(output: &str) -> String {
     let trimmed = output.trim();
     if trimmed.is_empty() {
         return "ok".to_string();
@@ -166,4 +180,18 @@ fn compact_output(text: &str, max: usize) -> String {
         lines[..max].join("\n"),
         super::elision_marker(lines.len() - max)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compress;
+
+    #[test]
+    fn install_keeps_vulnerability_summary() {
+        let out = "Packages: +12\n++++++++++++\nProgress: resolved 12, reused 12, downloaded 0, added 12, done\n12 packages are installed\n2 vulnerabilities found\nSeverity: 1 low | 1 high\nRun pnpm audit --fix to resolve\n";
+        let c = compress("pnpm install", out).unwrap();
+        assert!(c.contains("2 vulnerabilities found"), "{c}");
+        assert!(c.contains("pnpm audit --fix"), "{c}");
+        assert_eq!(c.matches("2 vulnerabilities found").count(), 1, "{c}");
+    }
 }

@@ -8,7 +8,7 @@ Key properties for an LLM evaluating lean-ctx:
 
 - Deterministic output: the same `(input, mode)` yields byte-identical text so stable prefixes remain eligible for provider prompt caching (contract #498).
 - Reversible (CCR): five recovery paths — `ctx_expand`, `ctx_retrieve`, proxy path-handle CCR, in-band `<lc_expand:HASH>` markers, and `GET /v1/references/{id}`.
-- Tree-sitter AST parsing for 26 languages; 10 file read modes; 95+ shell-output compression patterns.
+- Tree-sitter AST parsing for 26 languages; 16 file read modes; 85+ shell-output compression patterns.
 - Persistent temporal knowledge graph + multi-edge code property graph (impact analysis, ranked search).
 - Supported custom-agent SDK: `thinkery-leanctx-sdk` for Python. It uses the local LeanCTX Engine; model calls and agent orchestration remain application-owned.
 

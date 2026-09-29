@@ -3,3 +3,5 @@ source: tests/pattern_snapshots.rs
 expression: compressed
 ---
 ok (847 deps, 12s)
+3 vulnerabilities (1 moderate, 2 high)
+npm audit fix

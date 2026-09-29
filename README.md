@@ -128,10 +128,10 @@ Your AI agent reads files and runs commands. LeanCTX compresses both automatical
 - **Workload-specific token reduction** on eligible context, with recovery paths
   and a local Shadow Mode baseline for measurement
 
-- **File reads**: 10 read modes (`full`, `map`, `signatures`, `diff`, `lines:N-M`, `density:X`, …) — cached re-reads cost ~13 tokens
+- **File reads**: 16 read modes (`full`, `map`, `signatures`, `diff`, `lines:N-M`, `density:X`, …) — cached re-reads cost ~13 tokens
 - **Target density** (`density:0.4`): SDE-style budget compression — keeps the highest-entropy lines until ~40% of the original tokens remain, deterministic
 - **JIT disclosure**: `signatures` carries line spans and points at `lines:N-M` for targeted expansion — outline first, bodies on demand
-- **Shell output**: 95+ shell-output patterns compress git, npm, cargo, docker, kubectl, terraform and more (270 passthrough rules)
+- **Shell output**: 85+ shell-output patterns compress git, npm, cargo, docker, kubectl, terraform and more (250+ passthrough rules)
 - **Tree-sitter AST**: structural understanding for 27 languages — not just text compression
 - **Reversible by design (CCR)**: compression never *discards* content — pruned or truncated payloads move to a content-addressed store with a deterministic handle, so the model can pull the original bytes back on demand via `ctx_expand`, `ctx_retrieve`, an in-band marker, or `GET /v1/references/{id}`. [Five recovery paths →](docs/comparisons/vs-headroom.md#reversibility)
 
@@ -140,7 +140,7 @@ Your AI agent reads files and runs commands. LeanCTX compresses both automatical
 Not every task or file needs the same depth. LeanCTX classifies the task, then
 sends the signal rather than the noise.
 
-- **10 read modes**: from full content down to AST signatures and entropy-filtered views
+- **16 read modes**: from full content down to AST signatures and entropy-filtered views
 - **Adaptive `ModePredictor`**: learns the optimal read mode per file type from past sessions
 - **`IntentEngine`**: classifies query complexity so simple lookups stay cheap
 
@@ -617,16 +617,11 @@ vhs demo/benchmark.tape
 
 ## Benchmarks
 
-Real, reproduced numbers — never estimated. Measured on this repo with the GPT-4o
-tokenizer (`o200k_base`); a tool that isn't installed is reported as such, never
-guessed.
-
-| Read mode | Compression | Tokens (50 files) | Quality |
-|---|---:|---:|---:|
-| Raw read | 0% | 533.2K | 100% |
-| `map` | **98.1%** | 8.0K | 78% |
-| `signatures` | **96.7%** | 14.0K | 96% |
-| Cached re-read | ~99.99% | ~13 tok | 100% |
+Real, reproduced numbers — never estimated. The earlier per-read-mode
+compression table (`map` / `signatures` over 50 files) is **withdrawn** along
+with the other historical figures in [BENCHMARKS.md](BENCHMARKS.md); measure
+your own repository with `lean-ctx benchmark report .` instead. What stays
+true by construction: an unchanged cached re-read costs ~13 tokens.
 
 lean-ctx's **own cost is measured too**: the CI-measured fixed per-session
 footprint (advertised tool schemas + MCP instructions + wakeup briefing) is

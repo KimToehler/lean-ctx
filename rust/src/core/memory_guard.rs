@@ -622,6 +622,23 @@ fn macos_memsize() -> Option<u64> {
 pub mod tests {
     use super::*;
 
+    /// #1899: jemalloc reads the conf as a C string and rejects
+    /// `background_thread` wherever it lacks pthread support.
+    #[cfg(all(feature = "jemalloc", not(windows), not(target_env = "musl")))]
+    #[test]
+    fn jemalloc_conf_is_c_string_with_platform_safe_options() {
+        let conf = crate::JEMALLOC_CONF;
+        assert_eq!(conf.last(), Some(&0), "must be NUL-terminated");
+        let body = std::str::from_utf8(&conf[..conf.len() - 1]).unwrap();
+        assert!(!body.contains('\0'), "no interior NUL");
+        assert!(body.contains("dirty_decay_ms:1000"));
+        assert_eq!(
+            body.contains("background_thread"),
+            cfg!(target_os = "linux"),
+            "background_thread is only supported on Linux: {body}"
+        );
+    }
+
     #[test]
     fn rss_returns_some_on_supported_os() {
         if cfg!(any(target_os = "linux", target_os = "macos", windows)) {

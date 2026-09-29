@@ -38,7 +38,7 @@ lean-ctx read src/main.rs -m signatures
 lean-ctx read src/main.rs --fresh    # bypass cache
 ```
 
-**The 10 read modes** (`mode` param):
+**The 16 read modes** (`mode` param):
 
 | Mode | Returns | Use when |
 |------|---------|----------|
@@ -51,7 +51,13 @@ lean-ctx read src/main.rs --fresh    # bypass cache
 | `task` | lines relevant to a task | task-focused read |
 | `reference` | reference handle, not content | output too big to inline |
 | `diff` | lines changed since last read | re-checking a file |
-| `lines:N-M` | a specific range | you know where to look |
+| `lines:N-M` | a specific range (`lines:5,10-20`, `lines:-N` tail) | you know where to look |
+| `anchored` | whole file + per-line `N:hh|` anchors | you'll edit it via `ctx_patch` |
+| `full-compact` | whole file, no header, trailing whitespace stripped | you need faithful bytes, minimal framing |
+| `raw` | exact bytes, no framing | byte-exact content matters |
+| `cognitive` | 7±2 semantic chunks | you want the shape of a long file |
+| `mdl` | minimal structural description | you want the most compact outline |
+| `density:X` | highest-entropy lines until ~X of the tokens remain | you have a token budget |
 
 **Under the hood:** `ctx_read` consults the `SessionCache`; a cache hit returns a
 file reference instead of content. The mode predictor (`mode_stats.json`) learns

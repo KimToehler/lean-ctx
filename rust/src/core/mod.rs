@@ -552,6 +552,8 @@ pub(crate) mod chunks_ts;
 pub(crate) mod context_gc;
 pub mod deep_queries;
 pub(crate) mod deps;
+#[cfg(test)]
+mod doc_claims;
 pub mod editor_registry;
 pub(crate) mod firewall;
 pub mod pathjail;

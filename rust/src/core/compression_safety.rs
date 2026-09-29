@@ -36,11 +36,6 @@ pub(crate) const COMMAND_SAFETY_TABLE: &[CommandSafety] = &[
         description: "Disk usage — root filesystem must never be hidden",
     },
     CommandSafety {
-        command: "git status",
-        level: SafetyLevel::Verbatim,
-        description: "DETACHED HEAD, staged/unstaged lists preserved verbatim",
-    },
-    CommandSafety {
         command: "git stash",
         level: SafetyLevel::Verbatim,
         description: "Stash save/pop/list output preserved verbatim",
@@ -66,6 +61,11 @@ pub(crate) const COMMAND_SAFETY_TABLE: &[CommandSafety] = &[
         description: "Environment variables preserved (values filtered)",
     },
     // --- Minimal: light formatting, all critical data preserved ---
+    CommandSafety {
+        command: "git status",
+        level: SafetyLevel::Minimal,
+        description: "Branch/ahead count plus every staged, unstaged, unmerged and untracked path; hints dropped",
+    },
     CommandSafety {
         command: "git diff",
         level: SafetyLevel::Minimal,
@@ -135,7 +135,7 @@ pub(crate) const COMMAND_SAFETY_TABLE: &[CommandSafety] = &[
     CommandSafety {
         command: "npm install",
         level: SafetyLevel::Standard,
-        description: "Package count, vulnerability summary preserved",
+        description: "Package count, vulnerability summary and `audit fix` hint preserved",
     },
     CommandSafety {
         command: "docker build",
@@ -160,7 +160,7 @@ pub(crate) const COMMAND_SAFETY_TABLE: &[CommandSafety] = &[
     CommandSafety {
         command: "tsc",
         level: SafetyLevel::Standard,
-        description: "Type errors with file:line preserved",
+        description: "Type errors with full path, line:col, code and complete message preserved",
     },
     CommandSafety {
         command: "curl (JSON)",
@@ -269,5 +269,95 @@ mod tests {
             .find(|e| e.command == "git diff")
             .unwrap();
         assert_eq!(diff.level, SafetyLevel::Minimal);
+    }
+
+    /// One executable fixture per table promise (#1894): `(table entry, command
+    /// run, raw output, strings the compressed output must still contain)`.
+    /// Verbatim entries need no needles — their output must come back unchanged.
+    const CONTRACT_FIXTURES: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "npm install",
+            "npm install",
+            "\nadded 847 packages, and audited 848 packages in 12s\n\n142 packages are looking for funding\n  run `npm fund` for details\n\n3 vulnerabilities (1 moderate, 2 high)\n\nTo address all issues, run:\n  npm audit fix\n\nRun `npm audit` for details.\n",
+            &[
+                "847",
+                "3 vulnerabilities (1 moderate, 2 high)",
+                "npm audit fix",
+            ],
+        ),
+        (
+            "git status",
+            "git status",
+            "On branch main\nYour branch is ahead of 'origin/main' by 1 commit.\n\nUnmerged paths:\n\tboth modified:   c.rs\n\nChanges to be committed:\n\tnew file:   a.rs\n\nChanges not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n\tmodified:   b.rs\n\tdeleted:    gone.rs\n\nUntracked files:\n\tu.rs\n\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\n",
+            &["main", "c.rs", "a.rs", "b.rs", "gone.rs", "u.rs"],
+        ),
+        (
+            "git diff",
+            "git diff",
+            "diff --git a/src/a.rs b/src/a.rs\nindex 1111111..2222222 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,3 @@\n fn a() {\n-    old();\n+    new();\n }\n",
+            &["src/a.rs", "-    old();", "+    new();"],
+        ),
+        (
+            "npm audit",
+            "npm audit",
+            "# npm audit report\n\nlodash  <4.17.21\nSeverity: high\nCommand Injection in lodash - https://github.com/advisories/GHSA-35jh-r3h4-6jhm\nfix available via `npm audit fix`\nnode_modules/lodash\n\n1 high severity vulnerability\n\nTo address all issues, run:\n  npm audit fix\n",
+            &["lodash", "high", "GHSA-35jh-r3h4-6jhm", "npm audit fix"],
+        ),
+        (
+            "pytest",
+            "pytest",
+            "============================= test session starts ==============================\ncollected 9 items\n\ntests/test_a.py ..F.sxX..                                                  [100%]\n\n=========================== short test summary info ============================\nFAILED tests/test_a.py::test_c - AssertionError\n===== 1 failed, 5 passed, 1 skipped, 1 xfailed, 1 xpassed, 2 warnings in 0.12s =====\n",
+            &[
+                "1 failed",
+                "5 passed",
+                "1 skipped",
+                "1 xfailed",
+                "1 xpassed",
+                "2 warnings",
+            ],
+        ),
+        (
+            "tsc",
+            "tsc",
+            "src/a.ts(3,7): error TS2322: Type 'string' is not assignable to type 'number'.\nsrc/b.ts(10,1): error TS2304: Cannot find name 'foo'.\n\nFound 2 errors in 2 files.\n",
+            &[
+                "src/a.ts",
+                "3:7",
+                "TS2322",
+                "not assignable to type 'number'",
+                "src/b.ts",
+                "10:1",
+                "TS2304",
+            ],
+        ),
+    ];
+
+    fn entry(command: &str) -> &'static CommandSafety {
+        COMMAND_SAFETY_TABLE
+            .iter()
+            .find(|e| e.command == command)
+            .unwrap_or_else(|| panic!("fixture names unknown table entry {command:?}"))
+    }
+
+    #[test]
+    fn table_promises_hold_for_pattern_output() {
+        for (table_cmd, run, raw, needles) in CONTRACT_FIXTURES {
+            let level = entry(table_cmd).level;
+            let compressed = crate::core::patterns::compress_output(run, raw);
+            if level == SafetyLevel::Verbatim {
+                assert!(
+                    compressed.as_deref().is_none_or(|c| c.trim() == raw.trim()),
+                    "{table_cmd}: table says verbatim, pattern rewrote it:\n{compressed:?}"
+                );
+                continue;
+            }
+            let out = compressed.unwrap_or_else(|| raw.to_string());
+            for needle in *needles {
+                assert!(
+                    out.contains(needle),
+                    "{table_cmd}: table promise broken, {needle:?} missing from:\n{out}"
+                );
+            }
+        }
     }
 }

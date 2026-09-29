@@ -96,6 +96,7 @@ pub fn compress_output(command: &str, output: &str) -> Option<String> {
     if policy.is_protected() {
         return None;
     }
+    let command = strip_leading_cd(command);
 
     let stripped;
     let clean_output = {
@@ -159,6 +160,27 @@ pub fn compress_output(command: &str, output: &str) -> Option<String> {
     }
 
     None
+}
+
+/// `cd <dir> && <cmd>` produces exactly `<cmd>`'s output, so it must hit the
+/// same pattern as `<cmd>` (and as `git -C <dir> …`) instead of falling through
+/// to the generic truncation (#1893). Only that exact two-segment shape is
+/// unwrapped; anything longer mixes outputs and is left alone.
+pub(crate) fn strip_leading_cd(command: &str) -> &str {
+    use crate::core::shell_allowlist::Separator;
+    let segments = crate::core::shell_allowlist::segments_with_separators(command);
+    let [(first, Some(Separator::And)), (rest, None)] = segments.as_slice() else {
+        return command;
+    };
+    let is_plain_cd = first
+        .strip_prefix("cd ")
+        .is_some_and(|dir| !dir.trim().is_empty() && !dir.contains(['$', '`', '(']));
+    if !is_plain_cd {
+        return command;
+    }
+    command
+        .rfind(rest.as_str())
+        .map_or(command, |at| &command[at..])
 }
 
 /// True for version-control commands whose output is authoritative under their
@@ -225,6 +247,12 @@ type PatternHandler = fn(&str, &str) -> Option<String>;
 /// final, never falls through to a later entry. Registering a new CLI tool
 /// is now a one-line addition here instead of a new branch in
 /// `try_specific_pattern`.
+/// Number of registered shell-output patterns, for the docs drift check (#1896).
+#[cfg(test)]
+pub(crate) fn pattern_count() -> usize {
+    PATTERNS.len()
+}
+
 const PATTERNS: &[(PatternMatcher, PatternHandler)] = &[
     (
         |c| c.starts_with("git "),
@@ -955,6 +983,38 @@ mod tests {
         let huge = "line\n".repeat(5000);
         assert!(compress_output("gh run view 123 --log-failed", &huge).is_none());
         assert!(compress_output("gh run view 123 --log", &huge).is_none());
+    }
+
+    #[test]
+    fn strip_leading_cd_unwraps_only_plain_two_segment_cd() {
+        assert_eq!(strip_leading_cd("cd /x && git log -5"), "git log -5");
+        assert_eq!(strip_leading_cd("cd 'a b' && git status"), "git status");
+        assert_eq!(strip_leading_cd("git log -5"), "git log -5");
+        for kept in [
+            "cd /x && git log && git status",
+            "cd /x; git log",
+            "cd /x || git log",
+            "cd $HOME && git log",
+            "cd $(pwd) && git log",
+            "pushd /x && git log",
+        ] {
+            assert_eq!(strip_leading_cd(kept), kept, "{kept}");
+        }
+    }
+
+    #[test]
+    fn cd_prefixed_git_log_uses_git_pattern() {
+        let mut out = String::new();
+        for i in 0..30 {
+            out.push_str(&format!(
+                "commit {i:040x}\nAuthor: A <a@b.c>\nDate:   Mon Jan 1 00:00:00 2026 +0000\n\n    subject {i}\n\n    - bullet body line\n\n src/f{i}.rs | 4 ++--\n 1 file changed, 2 insertions(+), 2 deletions(-)\n\n"
+            ));
+        }
+        let plain = compress_output("git -C /x log --stat -30", &out);
+        let cd = compress_output("cd /x && git log --stat -30", &out);
+        assert!(plain.is_some());
+        assert_eq!(cd, plain);
+        assert!(cd.unwrap().contains("+60/-60 total"));
     }
 
     #[test]

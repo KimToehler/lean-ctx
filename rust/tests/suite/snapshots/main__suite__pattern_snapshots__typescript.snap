@@ -3,8 +3,12 @@ source: tests/pattern_snapshots.rs
 expression: compressed
 ---
 5 errors in 4 files:
-App.tsx:12 TS2322 Type 'string' is not assignable to type ...
-App.tsx:25 TS2345 Argument of type 'null' is not assignabl...
-utils.ts:3 TS7006 Parameter 'x' implicitly has an 'any' ty...
-api.ts:15 TS2304 Cannot find name 'Response'.
-types.ts:8 TS2739 Type '{}' is missing the following prope...
+src/App.tsx
+  12:5 TS2322 Type 'string' is not assignable to type 'number'.
+  25:10 TS2345 Argument of type 'null' is not assignable to parameter of type 'User'.
+src/utils.ts
+  3:1 TS7006 Parameter 'x' implicitly has an 'any' type.
+src/api.ts
+  15:3 TS2304 Cannot find name 'Response'.
+src/types.ts
+  8:5 TS2739 Type '{}' is missing the following properties from type 'Config': host, port

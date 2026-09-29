@@ -481,12 +481,15 @@ fn install_zshenv(home: &Path, quiet: bool, style: Style, stamp: &BackupStamp) {
     let redirect = redirect_block("ZSH_EXECUTION_STRING", &build_env_check());
     let hook = format!(
         r#"{MARKER_START}
-# Passthrough stubs: ensure _lc/_lc_compress exist in ALL zsh contexts
+# Passthrough stubs: ensure the alias targets (lean_ctx_track/_compress,
+# legacy _lc/_lc_compress) exist in ALL zsh contexts
 # (non-interactive subshells, eval, agent harnesses) so aliases that
 # reference them degrade gracefully instead of "command not found".
 # The full shell-hook.zsh overrides these when loaded via .zshrc.
 _lc()          {{ command "$@"; }}
 _lc_compress() {{ command "$@"; }}
+lean_ctx_track()    {{ command "$@"; }}
+lean_ctx_compress() {{ command "$@"; }}
 {redirect}
 {MARKER_END}"#
     );
@@ -503,6 +506,8 @@ fn install_bashenv(home: &Path, quiet: bool, style: Style, stamp: &BackupStamp) 
         r#"{MARKER_START}
 _lc()          {{ command "$@"; }}
 _lc_compress() {{ command "$@"; }}
+lean_ctx_track()    {{ command "$@"; }}
+lean_ctx_compress() {{ command "$@"; }}
 {redirect}
 {MARKER_END}"#
     );

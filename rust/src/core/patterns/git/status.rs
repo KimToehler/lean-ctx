@@ -1,13 +1,39 @@
 use super::{ahead_re, status_branch_re};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    None,
+    Staged,
+    Unstaged,
+    Unmerged,
+    Untracked,
+}
+
+/// `<label>:   <path>` → compact entry. Unknown labels are kept spelled out so
+/// no path is ever dropped.
+fn entry(label: &str, path: &str) -> String {
+    let sigil = match label {
+        "new file" => "+",
+        "modified" => "~",
+        "deleted" => "-",
+        "renamed" => "→",
+        "copied" => "©",
+        "typechange" => "±",
+        _ => return format!("{label}:{path}"),
+    };
+    format!("{sigil}{path}")
+}
+
 pub(super) fn compress_status(output: &str) -> String {
     let mut branch = String::new();
     let mut ahead = 0u32;
     let mut staged = Vec::new();
     let mut unstaged = Vec::new();
+    let mut unmerged = Vec::new();
     let mut untracked = Vec::new();
 
-    let mut section = "";
+    let mut section = Section::None;
+    let mut section_has_entries = false;
 
     for line in output.lines() {
         if let Some(caps) = status_branch_re().captures(line) {
@@ -17,52 +43,54 @@ pub(super) fn compress_status(output: &str) -> String {
             ahead = caps[1].parse().unwrap_or(0);
         }
 
-        if line.contains("Changes to be committed") {
-            section = "staged";
-        } else if line.contains("Changes not staged") {
-            section = "unstaged";
-        } else if line.contains("Untracked files") {
-            section = "untracked";
-        }
-
         let trimmed = line.trim();
-        if trimmed.starts_with("new file:") {
-            let file = trimmed.trim_start_matches("new file:").trim();
-            if section == "staged" {
-                staged.push(format!("+{file}"));
+        let header = match trimmed {
+            t if t.starts_with("Changes to be committed") => Some(Section::Staged),
+            t if t.starts_with("Changes not staged") => Some(Section::Unstaged),
+            t if t.starts_with("Unmerged paths") => Some(Section::Unmerged),
+            t if t.starts_with("Untracked files") => Some(Section::Untracked),
+            _ => None,
+        };
+        if let Some(next) = header {
+            section = next;
+            section_has_entries = false;
+            continue;
+        }
+        // A blank line after the file list closes it; git's trailing hints
+        // ("no changes added to commit …") are not paths (#1894).
+        if trimmed.is_empty() {
+            if section_has_entries {
+                section = Section::None;
             }
-        } else if trimmed.starts_with("modified:") {
-            let file = trimmed.trim_start_matches("modified:").trim();
-            match section {
-                "staged" => staged.push(format!("~{file}")),
-                "unstaged" => unstaged.push(format!("~{file}")),
-                _ => {}
-            }
-        } else if trimmed.starts_with("deleted:") {
-            let file = trimmed.trim_start_matches("deleted:").trim();
-            if section == "staged" {
-                staged.push(format!("-{file}"));
-            }
-        } else if trimmed.starts_with("renamed:") {
-            let file = trimmed.trim_start_matches("renamed:").trim();
-            if section == "staged" {
-                staged.push(format!("→{file}"));
-            }
-        } else if trimmed.starts_with("copied:") {
-            let file = trimmed.trim_start_matches("copied:").trim();
-            if section == "staged" {
-                staged.push(format!("©{file}"));
-            }
-        } else if section == "untracked"
-            && !trimmed.is_empty()
-            && !trimmed.starts_with('(')
-            && !trimmed.starts_with("Untracked")
-        {
-            untracked.push(trimmed.to_string());
+            continue;
+        }
+        if section == Section::None || trimmed.starts_with('(') {
+            continue;
+        }
+        section_has_entries = true;
+
+        let item = if section == Section::Untracked {
+            trimmed.to_string()
+        } else if let Some((label, path)) = trimmed.split_once(':') {
+            entry(label.trim(), path.trim())
+        } else {
+            trimmed.to_string()
+        };
+        match section {
+            Section::Staged => staged.push(item),
+            Section::Unstaged => unstaged.push(item),
+            Section::Unmerged => unmerged.push(item),
+            Section::Untracked => untracked.push(item),
+            Section::None => {}
         }
     }
 
-    if branch.is_empty() && staged.is_empty() && unstaged.is_empty() && untracked.is_empty() {
+    if branch.is_empty()
+        && staged.is_empty()
+        && unstaged.is_empty()
+        && unmerged.is_empty()
+        && untracked.is_empty()
+    {
         return output.trim().to_string();
     }
 
@@ -79,14 +107,15 @@ pub(super) fn compress_status(output: &str) -> String {
     };
     parts.push(format!("{branch_display}{ahead_str}"));
 
-    if !staged.is_empty() {
-        parts.push(format!("staged: {}", staged.join(" ")));
-    }
-    if !unstaged.is_empty() {
-        parts.push(format!("unstaged: {}", unstaged.join(" ")));
-    }
-    if !untracked.is_empty() {
-        parts.push(format!("untracked: {}", untracked.join(" ")));
+    for (name, list) in [
+        ("unmerged", &unmerged),
+        ("staged", &staged),
+        ("unstaged", &unstaged),
+        ("untracked", &untracked),
+    ] {
+        if !list.is_empty() {
+            parts.push(format!("{name}: {}", list.join(" ")));
+        }
     }
 
     if output.contains("nothing to commit") && parts.len() == 1 {
@@ -94,4 +123,34 @@ pub(super) fn compress_status(output: &str) -> String {
     }
 
     parts.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compress_status;
+
+    #[test]
+    fn trailing_hint_is_not_an_untracked_path() {
+        let out = "On branch main\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tnew_file.rs\n\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\n";
+        assert_eq!(compress_status(out), "main\nuntracked: new_file.rs");
+    }
+
+    #[test]
+    fn every_path_kind_is_kept() {
+        let out = "On branch dev\nYour branch is ahead of 'origin/dev' by 2 commits.\n\n\
+Unmerged paths:\n  (use \"git add <file>...\" to mark resolution)\n\tboth modified:   conflict.rs\n\n\
+Changes to be committed:\n\tnew file:   a.rs\n\trenamed:    old.rs -> new.rs\n\ttypechange: link\n\n\
+Changes not staged for commit:\n\tmodified:   b.rs\n\tdeleted:    gone.rs\n\n\
+Untracked files:\n\tu.rs\n";
+        assert_eq!(
+            compress_status(out),
+            "dev ↑2\nunmerged: both modified:conflict.rs\nstaged: +a.rs →old.rs -> new.rs ±link\nunstaged: ~b.rs -gone.rs\nuntracked: u.rs"
+        );
+    }
+
+    #[test]
+    fn clean_tree() {
+        let out = "On branch main\nnothing to commit, working tree clean\n";
+        assert_eq!(compress_status(out), "main\nclean");
+    }
 }

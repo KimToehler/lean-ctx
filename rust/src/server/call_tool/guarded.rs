@@ -110,13 +110,21 @@ impl LeanCtxServer {
         // It previously hung off `call_count`, which only advances in
         // `record_checkpoint` — skipped entirely when `minimal_overhead`
         // (default true) is set. Between the two, the daily telemetry flush
-        // never ran in a default install.
+        // never ran in a default install. The first call attempts the daily
+        // send too, so installs whose sessions stay short are still counted;
+        // in between, counters are persisted so no process loses its calls.
         let tick = self
             .background_tick
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        if tick.is_multiple_of(100) {
+        if tick == 1 || tick.is_multiple_of(100) {
             std::thread::spawn(crate::cloud_sync::cloud_background_tasks);
+        } else if tick.is_multiple_of(10) {
+            std::thread::spawn(|| {
+                if let Err(error) = crate::core::telemetry_aggregate::persist_process_counters() {
+                    tracing::debug!("telemetry counters not persisted: {error}");
+                }
+            });
         }
 
         let original_name = request.name.as_ref().to_string();

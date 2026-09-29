@@ -3,9 +3,9 @@
 //! Privacy-safe daily telemetry aggregation.
 
 use sha2::Digest;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,7 @@ use super::telemetry_v2::{
     ToolCallCount, ToolCallMetrics, ToolUsageMetrics, VersionUpgradeMetrics, valid_tool_name,
 };
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CounterCheckpoint {
     tool_calls: u64,
@@ -43,6 +43,8 @@ struct ToolCounterCheckpoint {
 struct AggregateState {
     #[serde(default)]
     installation_id: String,
+    /// Legacy in-process baseline, kept so older state files still load.
+    /// Unsent counters now live durably in [`QueuedOneShots::counters`].
     process_nonce: String,
     acknowledged: CounterCheckpoint,
     pending: Option<PendingBatch>,
@@ -79,6 +81,10 @@ struct QueuedOneShots {
     checkout_started: u64,
     #[serde(default)]
     error_categories: [u64; 8],
+    /// Tool counters folded in by every process and not yet acknowledged, so
+    /// short sessions and calls after the daily send reach the next batch.
+    #[serde(default)]
+    counters: CounterCheckpoint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,15 +153,16 @@ pub fn preview_daily_batch() -> Result<TelemetryBatchV2, String> {
     if let Some(pending) = state.pending {
         return Ok(pending.batch);
     }
-    let observed = current_checkpoint();
     let sidecar_path = one_shot_path()?;
     ensure_parent(&sidecar_path)?;
     let sidecar_lock = open_sidecar_lock(&sidecar_path)?;
     sidecar_lock.try_lock_exclusive().map_err(|error| {
         format!("exact telemetry preview unavailable: cannot lock one-shot state: {error}")
     })?;
-    let one_shots = one_shots_for_current_identity(load_one_shots_at(&sidecar_path)?)?;
-    build_from_current_counters(&state, &observed, &one_shots.queued)
+    let mut one_shots = one_shots_for_current_identity(load_one_shots_at(&sidecar_path)?)?;
+    // Fold in memory only: the preview must not advance durable state.
+    fold_process_counters(&sidecar_path, &mut one_shots);
+    build_from_queued(&one_shots.queued)
 }
 
 /// Freeze one payload until the sender explicitly acknowledges success.
@@ -165,9 +172,15 @@ fn prepare_daily_batch() -> Result<TelemetryBatchV2, String> {
         if let Some(pending) = &state.pending {
             return Ok((state.clone(), pending.batch.clone()));
         }
-        let observed = current_checkpoint();
-        let one_shots = load_one_shots()?;
-        let batch = build_from_current_counters(&state, &observed, &one_shots.queued)?;
+        let sidecar_path = one_shot_path()?;
+        ensure_parent(&sidecar_path)?;
+        let sidecar_lock = open_sidecar_lock(&sidecar_path)?;
+        lock_telemetry_file(&sidecar_lock, "one-shot")?;
+        let mut one_shots = one_shots_for_current_identity(load_one_shots_at(&sidecar_path)?)?;
+        let observed = fold_process_counters(&sidecar_path, &mut one_shots);
+        write_one_shots(&sidecar_path, &one_shots)?;
+        mark_folded(&sidecar_path, observed.clone());
+        let batch = build_from_queued(&one_shots.queued)?;
         state.installation_id = batch_installation_id(&batch).to_string();
         state.pending = Some(PendingBatch {
             batch: batch.clone(),
@@ -211,9 +224,11 @@ fn begin_daily_send_in_bucket(bucket: Option<&str>) -> Result<DailySendLease, St
         ensure_parent(&one_shot_path)?;
         let one_shot_lock = open_sidecar_lock(&one_shot_path)?;
         lock_telemetry_file(&one_shot_lock, "one-shot")?;
-        let one_shots = one_shots_for_current_identity(load_one_shots_at(&one_shot_path)?)?;
-        let observed = current_checkpoint();
-        let batch = build_in_bucket(&state, &observed, &one_shots.queued, bucket)?;
+        let mut one_shots = one_shots_for_current_identity(load_one_shots_at(&one_shot_path)?)?;
+        let observed = fold_process_counters(&one_shot_path, &mut one_shots);
+        write_one_shots(&one_shot_path, &one_shots)?;
+        mark_folded(&one_shot_path, observed.clone());
+        let batch = build_in_bucket(&one_shots.queued, bucket)?;
         state.installation_id = batch_installation_id(&batch).to_string();
         state.pending = Some(PendingBatch {
             batch: batch.clone(),
@@ -320,23 +335,14 @@ fn batch_installation_id(batch: &TelemetryBatchV2) -> &str {
         .map_or("", |event| event.installation_id.as_str())
 }
 
-fn build_from_current_counters(
-    state: &AggregateState,
-    observed: &CounterCheckpoint,
-    queued: &QueuedOneShots,
-) -> Result<TelemetryBatchV2, String> {
-    build_in_bucket(state, observed, queued, current_send_bucket())
+fn build_from_queued(queued: &QueuedOneShots) -> Result<TelemetryBatchV2, String> {
+    build_in_bucket(queued, current_send_bucket())
 }
 
 /// Build the payload for one explicit bucket. Split out so a caller that has
 /// already resolved the bucket under a lock stamps that exact value instead of
 /// reading the clock a second time.
-fn build_in_bucket(
-    state: &AggregateState,
-    observed: &CounterCheckpoint,
-    queued: &QueuedOneShots,
-    bucket: String,
-) -> Result<TelemetryBatchV2, String> {
+fn build_in_bucket(queued: &QueuedOneShots, bucket: String) -> Result<TelemetryBatchV2, String> {
     let (installation_id, deletion_token) = installation_id::get_or_create_identity()
         .map_err(|error| format!("installation ID unavailable: {error}"))?;
     build_daily_aggregate(
@@ -345,8 +351,6 @@ fn build_in_bucket(
         bucket,
         distribution_channel(),
         client_family(),
-        state,
-        observed,
         queued,
     )
 }
@@ -357,16 +361,10 @@ fn build_daily_aggregate(
     timestamp_bucket: String,
     distribution_channel: DistributionChannel,
     client_family: ClientFamily,
-    state: &AggregateState,
-    observed: &CounterCheckpoint,
     queued: &QueuedOneShots,
 ) -> Result<TelemetryBatchV2, String> {
-    let empty = CounterCheckpoint::default();
-    let baseline = if state.process_nonce == process_nonce() {
-        &state.acknowledged
-    } else {
-        &empty
-    };
+    let observed = &queued.counters;
+    let baseline = CounterCheckpoint::default();
     let latency_counts = bounded_histogram_delta(
         &observed.tool_latency_buckets,
         &baseline.tool_latency_buckets,
@@ -595,6 +593,149 @@ fn process_nonce() -> &'static str {
     static NONCE: OnceLock<String> = OnceLock::new();
     NONCE.get_or_init(|| uuid::Uuid::new_v4().to_string())
 }
+
+/// This process's counters already folded into each sidecar, keyed by path so
+/// an isolated state directory starts from zero.
+fn folded_baselines() -> &'static Mutex<HashMap<PathBuf, CounterCheckpoint>> {
+    static FOLDED: OnceLock<Mutex<HashMap<PathBuf, CounterCheckpoint>>> = OnceLock::new();
+    FOLDED.get_or_init(Mutex::default)
+}
+
+/// Add this process's not-yet-folded counters to `one_shots.queued` in memory
+/// and return the observed checkpoint. Callers that persist the result must
+/// then [`mark_folded`] it while still holding the sidecar lock.
+fn fold_process_counters(
+    path: &std::path::Path,
+    one_shots: &mut OneShotState,
+) -> CounterCheckpoint {
+    let observed = current_checkpoint();
+    let folded = folded_baselines()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(path)
+        .cloned()
+        .unwrap_or_default();
+    add_counters(
+        &mut one_shots.queued.counters,
+        &counter_delta(&observed, &folded),
+    );
+    observed
+}
+
+fn mark_folded(path: &std::path::Path, observed: CounterCheckpoint) {
+    folded_baselines()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf(), observed);
+}
+
+/// Persist this process's unsent tool counters so they survive process exit
+/// and reach the next daily batch. While telemetry is disabled the counters
+/// are skipped instead, so re-enabling never back-fills opted-out activity.
+pub fn persist_process_counters() -> Result<(), String> {
+    let path = one_shot_path()?;
+    if !telemetry_collection_eligible() {
+        mark_folded(&path, current_checkpoint());
+        return Ok(());
+    }
+    ensure_parent(&path)?;
+    let lock = open_sidecar_lock(&path)?;
+    lock_telemetry_file(&lock, "one-shot")?;
+    let mut one_shots = one_shots_for_current_identity(load_one_shots_at(&path)?)?;
+    let before = one_shots.queued.counters.clone();
+    let observed = fold_process_counters(&path, &mut one_shots);
+    if one_shots.queued.counters != before {
+        write_one_shots(&path, &one_shots)?;
+    }
+    mark_folded(&path, observed);
+    Ok(())
+}
+
+fn counter_delta(observed: &CounterCheckpoint, baseline: &CounterCheckpoint) -> CounterCheckpoint {
+    CounterCheckpoint {
+        tool_calls: observed.tool_calls.saturating_sub(baseline.tool_calls),
+        tool_failures: observed
+            .tool_failures
+            .saturating_sub(baseline.tool_failures),
+        tool_latency_buckets: std::array::from_fn(|index| {
+            observed.tool_latency_buckets[index]
+                .saturating_sub(baseline.tool_latency_buckets[index])
+        }),
+        session_uptime_secs: observed
+            .session_uptime_secs
+            .saturating_sub(baseline.session_uptime_secs),
+        tools: observed
+            .tools
+            .iter()
+            .filter_map(|(tool, counter)| {
+                let base = baseline.tools.get(tool).copied().unwrap_or_default();
+                let delta = ToolCounterCheckpoint {
+                    calls: counter.calls.saturating_sub(base.calls),
+                    failures: counter.failures.saturating_sub(base.failures),
+                };
+                (delta.calls > 0 || delta.failures > 0).then(|| (tool.clone(), delta))
+            })
+            .collect(),
+    }
+}
+
+fn add_counters(total: &mut CounterCheckpoint, delta: &CounterCheckpoint) {
+    total.tool_calls = total.tool_calls.saturating_add(delta.tool_calls);
+    total.tool_failures = total.tool_failures.saturating_add(delta.tool_failures);
+    for (bucket, added) in total
+        .tool_latency_buckets
+        .iter_mut()
+        .zip(delta.tool_latency_buckets)
+    {
+        *bucket = bucket.saturating_add(added);
+    }
+    total.session_uptime_secs = total
+        .session_uptime_secs
+        .saturating_add(delta.session_uptime_secs);
+    for (tool, added) in &delta.tools {
+        if !total.tools.contains_key(tool) && total.tools.len() >= MAX_PERSISTED_TOOLS {
+            continue;
+        }
+        let entry = total.tools.entry(tool.clone()).or_default();
+        entry.calls = entry.calls.saturating_add(added.calls);
+        entry.failures = entry.failures.saturating_add(added.failures);
+    }
+}
+
+/// Remove exactly what an acknowledged batch carried. Totals are re-derived
+/// from the latency buckets so they stay consistent even if an identity
+/// reset zeroed the queue between prepare and acknowledgement.
+fn subtract_counters(total: &mut CounterCheckpoint, included: &CounterCheckpoint) {
+    for (bucket, sent) in total
+        .tool_latency_buckets
+        .iter_mut()
+        .zip(included.tool_latency_buckets)
+    {
+        *bucket = bucket.saturating_sub(sent);
+    }
+    total.tool_calls = total.tool_latency_buckets.iter().sum();
+    total.tool_failures = total
+        .tool_failures
+        .saturating_sub(included.tool_failures)
+        .min(total.tool_calls);
+    total.session_uptime_secs = total
+        .session_uptime_secs
+        .saturating_sub(included.session_uptime_secs);
+    for (tool, sent) in &included.tools {
+        if let Some(entry) = total.tools.get_mut(tool) {
+            entry.calls = entry.calls.saturating_sub(sent.calls);
+            entry.failures = entry
+                .failures
+                .saturating_sub(sent.failures)
+                .min(entry.calls);
+        }
+    }
+    total.tools.retain(|_, counter| counter.calls > 0);
+}
+
+/// Upper bound on distinct tool names kept in the sidecar; the batch itself
+/// keeps at most [`MAX_TOOL_ENTRIES`] of them.
+const MAX_PERSISTED_TOOLS: usize = 256;
 
 fn state_path() -> Result<PathBuf, String> {
     crate::core::paths::state_dir().map(|dir| dir.join("telemetry_v2_aggregate.json"))
@@ -846,6 +987,7 @@ pub fn rotate_identity_state_then<T>(
     one_shots.queued.autopilot_fallback = DecisionMetrics::default();
     one_shots.queued.checkout_started = 0;
     one_shots.queued.error_categories = [0; 8];
+    one_shots.queued.counters = CounterCheckpoint::default();
     one_shots.last_acknowledged_batch = None;
     remove_state_file(&path, "aggregate")?;
     write_one_shots(&one_shot_path, &one_shots)?;
@@ -872,16 +1014,6 @@ fn load_state_at(path: &std::path::Path) -> Result<AggregateState, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AggregateState::default()),
         Err(error) => Err(format!("cannot read telemetry aggregate state: {error}")),
     }
-}
-
-#[cfg(test)]
-fn load_one_shots() -> Result<OneShotState, String> {
-    let path = one_shot_path()?;
-    ensure_parent(&path)?;
-    let lock = open_sidecar_lock(&path)?;
-    lock.lock_exclusive()
-        .map_err(|error| format!("cannot lock telemetry one-shot state: {error}"))?;
-    one_shots_for_current_identity(load_one_shots_at(&path)?)
 }
 
 fn load_one_shots_at(path: &std::path::Path) -> Result<OneShotState, String> {
@@ -912,6 +1044,7 @@ fn one_shots_for_current_identity(mut state: OneShotState) -> Result<OneShotStat
         state.queued.autopilot_fallback = DecisionMetrics::default();
         state.queued.checkout_started = 0;
         state.queued.error_categories = [0; 8];
+        state.queued.counters = CounterCheckpoint::default();
         state.last_acknowledged_batch = None;
     }
     Ok(state)
@@ -981,6 +1114,7 @@ fn acknowledge_one_shots_at(
     {
         *queued = queued.saturating_sub(included);
     }
+    subtract_counters(&mut state.queued.counters, &included.counters);
     if let Some(sent) = included.version_upgrade {
         state.queued.version_upgrade = match state.queued.version_upgrade {
             Some(current) if current == sent => None,

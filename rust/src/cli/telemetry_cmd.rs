@@ -157,23 +157,30 @@ fn show_status() {
     println!("  \x1b[2mInspect: lean-ctx telemetry show\x1b[0m");
 }
 
-fn set_enabled(enabled: bool) {
-    let preference = if enabled {
-        "explicitly_enabled"
+/// Config writes for `telemetry on|off`, applied atomically. Every key must
+/// exist in the config schema — one unknown key fails the whole update.
+/// Legacy `cloud.contribute_enabled` is migrated by the config loader.
+fn consent_updates(enabled: bool) -> [(&'static str, &'static str); 3] {
+    let (value, preference) = if enabled {
+        ("true", "explicitly_enabled")
     } else {
-        "explicitly_disabled"
+        ("false", "explicitly_disabled")
     };
-    match config::setter::set_many_by_key(&[
-        ("telemetry.enabled", if enabled { "true" } else { "false" }),
+    [
+        ("telemetry.enabled", value),
         ("telemetry.preference", preference),
         ("telemetry.notice_shown", "true"),
-        ("cloud.contribute_enabled", "false"),
-    ]) {
+    ]
+}
+
+fn set_enabled(enabled: bool) {
+    match config::setter::set_many_by_key(&consent_updates(enabled)) {
         Ok(_) => {
             if enabled {
                 println!("Telemetry enabled — thank you for helping improve lean-ctx!");
-                println!("Sent daily: version, OS, arch, compression patterns, random install ID.");
-                println!("No code, no file names, no personal data — ever.");
+                println!("Sent daily: version, OS/arch, anonymous install ID, AI client family,");
+                println!("integration mode, call counts per built-in tool, coarse aggregates.");
+                println!("No prompts, code, file names, commands or secrets — ever.");
                 println!("\x1b[2mDisable anytime: lean-ctx telemetry off\x1b[0m");
             } else {
                 println!("Telemetry disabled. No data will be sent.");
@@ -398,6 +405,16 @@ mod tests {
         assert!(!ledger.exists());
         assert!(!aggregate.exists());
         assert!(!one_shots.exists());
+    }
+
+    #[test]
+    fn consent_updates_only_write_schema_keys() {
+        let schema = config::schema::ConfigSchema::generate();
+        for enabled in [true, false] {
+            for (key, _) in consent_updates(enabled) {
+                assert!(schema.lookup(key).is_some(), "unknown config key {key}");
+            }
+        }
     }
 
     #[test]

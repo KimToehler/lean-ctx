@@ -156,7 +156,9 @@ pub fn preview_daily_batch() -> Result<TelemetryBatchV2, String> {
     let sidecar_path = one_shot_path()?;
     ensure_parent(&sidecar_path)?;
     let sidecar_lock = open_sidecar_lock(&sidecar_path)?;
-    sidecar_lock.try_lock_exclusive().map_err(|error| {
+    // Tool calls hold this lock briefly to persist counters; wait out that
+    // window instead of failing a concurrent preview.
+    lock_telemetry_file(&sidecar_lock, "one-shot").map_err(|error| {
         format!("exact telemetry preview unavailable: cannot lock one-shot state: {error}")
     })?;
     let mut one_shots = one_shots_for_current_identity(load_one_shots_at(&sidecar_path)?)?;

@@ -13,7 +13,8 @@ Send holds the aggregate lease across HTTP, ledger append and acknowledgement;
 acknowledgement takes the one-shot lock only after the ledger guard is released.
 Version recording may take ledger under one-shot; purge/rotation callbacks must
 not reacquire aggregate or one-shot. Each production acquisition has a 750-ms
-retry budget (preview uses an immediate try-lock); scheduling may delay return.
+retry budget (preview try-locks aggregate, then waits that budget for one-shot);
+scheduling may delay return.
 The telemetry-v2 batch POST has a ten-second global transport timeout; this does
 not impose a deadline on filesystem I/O or promise cancellation of an in-flight
 request after opt-out. Its fresh config read takes no config writer/cache lock.

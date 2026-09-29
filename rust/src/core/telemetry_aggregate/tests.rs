@@ -207,14 +207,14 @@ fn preview_fails_fast_during_send_then_preserves_concurrent_counts() {
 
 #[test]
 #[serial_test::serial]
-fn preview_fails_fast_during_sidecar_write_and_recovers() {
+fn preview_gives_up_on_held_sidecar_lock_and_recovers() {
     let _iso = crate::core::data_dir::isolated_data_dir();
     record_sync_result(true).expect("record result");
     {
         let path = one_shot_path().expect("sidecar path");
         let lock = open_sidecar_lock(&path).expect("open lock");
         lock.lock_exclusive().expect("hold writer lock");
-        let error = preview_daily_batch().expect_err("preview must not wait for writer");
+        let error = preview_daily_batch().expect_err("preview wait for a held writer is bounded");
         assert!(error.contains("cannot lock one-shot state"));
     }
     assert_eq!(

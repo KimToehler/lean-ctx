@@ -38,6 +38,7 @@ pub(in crate::server) async fn dispatch_and_post_process(
                 // respawn the server. Return a soft tool error so the agent
                 // sees the validation message and can fix parameter names.
                 if e.code == rmcp::model::ErrorCode::INVALID_PARAMS {
+                    super::error_telemetry::record_mcp_error(e.code);
                     tracing::debug!(
                         "converting INVALID_PARAMS to soft tool error for '{name}': {}",
                         e.message
@@ -55,6 +56,7 @@ pub(in crate::server) async fn dispatch_and_post_process(
                     return Ok(result);
                 }
 
+                super::error_telemetry::record_mcp_error(e.code);
                 record_decision_loop_end_error(decision_context.as_ref(), args, shadow_auto_record);
                 return Err(e);
             }
@@ -1094,9 +1096,15 @@ pub(in crate::server) async fn dispatch_and_post_process(
     // original/saved/mode and the measured handler duration. The previous
     // zero-filled append here overwrote every row with `orig=0 saved=0 mode=-`.
 
-    let current_count = server.call_count.load(std::sync::atomic::Ordering::Relaxed);
+    // The cloud/telemetry flush is scheduled at the top of `call_tool_guarded`
+    // (see `background_tick`): this function is skipped for guard-denied and
+    // response-cached calls, so counting here would miss them. Archive cleanup
+    // and knowledge consolidation stay on the dispatch path, where they only
+    // have work when a call actually produced output.
+    let current_count = server
+        .background_tick
+        .load(std::sync::atomic::Ordering::Relaxed);
     if current_count > 0 && current_count.is_multiple_of(100) {
-        std::thread::spawn(crate::cloud_sync::cloud_background_tasks);
         // Bound the on-disk archive between restarts: prune TTL-expired and
         // over-budget entries off the hot path so it can't grow unbounded and
         // starve the host of RAM via the page cache (#417).
@@ -1142,6 +1150,7 @@ pub(in crate::server) async fn dispatch_and_post_process(
     let compressed_input_tokens = crate::core::tokens::count_tokens(&result_text) as u64;
     let raw_input_tokens = compressed_input_tokens
         .saturating_add(u64::try_from(tool_saved_tokens).unwrap_or(u64::MAX));
+    super::error_telemetry::record_shell_error_category(shell_outcome.as_ref(), &result_text);
     let mut result = finalize_call_result(&result_text, shell_outcome);
     let has_dynamic = had_auto_context || had_budget_warning || had_throttle_warning;
     let mut meta = rmcp::model::Meta::new();

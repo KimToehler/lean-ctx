@@ -37,6 +37,20 @@ fn record_event(
     action: Option<&str>,
     decisions: Vec<AutonomyDriverDecisionV1>,
 ) {
+    let admitted = decisions
+        .iter()
+        .filter(|decision| decision.verdict == AutonomyVerdictV1::Run)
+        .count() as u64;
+    let denied = decisions
+        .iter()
+        .filter(|decision| decision.verdict == AutonomyVerdictV1::Skip)
+        .count() as u64;
+    if (admitted > 0 || denied > 0)
+        && let Err(error) =
+            crate::core::telemetry_aggregate::record_autopilot_decisions(admitted, denied)
+    {
+        tracing::debug!("telemetry autopilot aggregate unavailable: {error}");
+    }
     let mut store = crate::core::autonomy_drivers::AutonomyDriversV1::load();
     let ev = AutonomyDriverEventV1 {
         seq: 0,
@@ -147,6 +161,9 @@ pub fn session_lifecycle_pre_hook(
     record_event(AutonomyPhaseV1::PreCall, tool_name, None, decisions);
 
     if empty {
+        if let Err(error) = crate::core::telemetry_aggregate::record_autopilot_fallback() {
+            tracing::debug!("telemetry autopilot fallback aggregate unavailable: {error}");
+        }
         return None;
     }
 
@@ -553,15 +570,14 @@ pub fn maybe_auto_response(
     let duration = start.elapsed();
     let output_tokens = count_tokens(&compressed);
 
-    let (verdict, reason_code, reason) = if compressed == output {
+    let fallback = compressed == output;
+    let (reason_code, reason) = if fallback {
         (
-            AutonomyVerdictV1::Skip,
             "no_savings".to_string(),
             "ctx_response made no changes".to_string(),
         )
     } else {
         (
-            AutonomyVerdictV1::Run,
             "output_large".to_string(),
             "response shaping applied".to_string(),
         )
@@ -573,7 +589,7 @@ pub fn maybe_auto_response(
         action,
         vec![AutonomyDriverDecisionV1 {
             driver: AutonomyDriverKindV1::Response,
-            verdict,
+            verdict: AutonomyVerdictV1::Run,
             reason_code,
             reason,
             detail: Some(format!(
@@ -584,6 +600,9 @@ pub fn maybe_auto_response(
             )),
         }],
     );
+    if fallback && let Err(error) = crate::core::telemetry_aggregate::record_autopilot_fallback() {
+        tracing::debug!("telemetry autopilot fallback aggregate unavailable: {error}");
+    }
 
     compressed
 }

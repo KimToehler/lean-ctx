@@ -402,35 +402,26 @@ impl Config {
 
     /// Migrate legacy `[cloud] contribute_enabled` → `[telemetry] enabled`.
     ///
-    /// If the user opted into the old anonymous contribute system but has not
-    /// yet enabled the new unified telemetry flag, flip `telemetry.enabled`
-    /// on and clear `contribute_enabled` so the migration is one-way.
+    /// A persisted `enabled = false` wins over the legacy opt-in. Otherwise the
+    /// legacy choice becomes `ExplicitlyEnabled`; it never masquerades as the
+    /// new default-on state.
     /// Persists the change to disk so subsequent loads see the new state.
     pub(crate) fn migrate_contribute_to_telemetry(&mut self) {
-        if self.cloud.contribute_enabled && !self.telemetry.enabled {
-            self.telemetry.enabled = true;
+        if self.cloud.contribute_enabled {
+            let preserve_opt_out = self.telemetry.explicitly_disabled();
             self.cloud.contribute_enabled = false;
+            if !preserve_opt_out {
+                self.telemetry.enabled = true;
+                self.telemetry.preference = super::TelemetryPreference::ExplicitlyEnabled;
+            }
 
             if let Some(path) = Self::path() {
                 if let Ok(raw) = std::fs::read_to_string(&path) {
-                    let mut updated =
-                        raw.replace("contribute_enabled = true", "contribute_enabled = false");
-                    if !updated.contains("[telemetry]") {
-                        if !updated.ends_with('\n') {
-                            updated.push('\n');
-                        }
-                        updated.push_str("\n[telemetry]\nenabled = true\n");
-                    } else if let Some(tpos) = updated.find("[telemetry]") {
-                        let after = &updated[tpos..];
-                        if let Some(epos) = after.find("enabled = false") {
-                            let abs_pos = tpos + epos;
-                            updated.replace_range(
-                                abs_pos..abs_pos + "enabled = false".len(),
-                                "enabled = true",
-                            );
-                        }
+                    if let Some(updated) =
+                        migrate_legacy_contribute_document(&raw, preserve_opt_out)
+                    {
+                        let _ = crate::config_io::write_atomic_with_backup(&path, &updated);
                     }
-                    let _ = crate::config_io::write_atomic_with_backup(&path, &updated);
                 }
             }
         }
@@ -467,14 +458,87 @@ impl Config {
         Self::path().map_or_else(Self::default, |p| Self::load_global_from(&p))
     }
 
+    /// Strict variant of [`Config::load_global`]: an unreadable or unparseable
+    /// global config is an error instead of silently becoming the defaults.
+    /// Consent-gated paths (telemetry send) must use this so a corrupt file
+    /// never turns into default-on behaviour.
+    pub fn try_load_global() -> Result<Self, super::error::LeanCtxError> {
+        let path = Self::path().ok_or_else(|| {
+            super::error::LeanCtxError::Config("cannot determine home directory".into())
+        })?;
+        Self::try_load_global_from(&path)
+    }
+
+    pub(super) fn try_load_global_from(path: &Path) -> Result<Self, super::error::LeanCtxError> {
+        match std::fs::read_to_string(path) {
+            Ok(raw) if !raw.trim().is_empty() => toml::from_str(&raw).map_err(|error| {
+                super::error::LeanCtxError::Config(
+                    format!("refusing invalid global config.toml ({error})").into(),
+                )
+            }),
+            Ok(_) => Ok(Self::default()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Path-parameterized core of [`Config::load_global`] (unit-testable without
     /// the real config dir). Missing, empty, or unparseable files yield
     /// defaults; persisting callers that must not clobber a corrupt file use
     /// [`Config::update_global`], which refuses instead.
     pub(super) fn load_global_from(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(raw) if !raw.trim().is_empty() => toml::from_str(&raw).unwrap_or_default(),
-            _ => Self::default(),
+        Self::try_load_global_from(path).unwrap_or_default()
+    }
+}
+
+fn migrate_legacy_contribute_document(raw: &str, preserve_opt_out: bool) -> Option<String> {
+    let mut document = raw.parse::<toml_edit::DocumentMut>().ok()?;
+    document["cloud"]["contribute_enabled"] = toml_edit::value(false);
+    if !preserve_opt_out {
+        document["telemetry"]["enabled"] = toml_edit::value(true);
+        document["telemetry"]["preference"] = toml_edit::value("explicitly_enabled");
+        if document
+            .get("telemetry")
+            .and_then(|table| table.get("notice_shown"))
+            .is_none()
+        {
+            document["telemetry"]["notice_shown"] = toml_edit::value(false);
         }
+    }
+    Some(document.to_string())
+}
+
+#[cfg(test)]
+mod telemetry_migration_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_opt_in_becomes_explicit_and_notice_gated() {
+        let migrated = migrate_legacy_contribute_document(
+            "# keep me\n[cloud]\ncontribute_enabled = true\n",
+            false,
+        )
+        .expect("valid TOML");
+        assert!(migrated.contains("# keep me"));
+        let cfg: Config = toml::from_str(&migrated).expect("migrated config");
+        assert!(!cfg.cloud.contribute_enabled);
+        assert!(cfg.telemetry.enabled);
+        assert_eq!(
+            cfg.telemetry.preference,
+            super::super::TelemetryPreference::ExplicitlyEnabled
+        );
+        assert!(!cfg.telemetry.notice_shown);
+    }
+
+    #[test]
+    fn legacy_contribute_never_overrides_explicit_opt_out() {
+        let migrated = migrate_legacy_contribute_document(
+            "[cloud]\ncontribute_enabled = true\n[telemetry]\nenabled = false\n",
+            true,
+        )
+        .expect("valid TOML");
+        let cfg: Config = toml::from_str(&migrated).expect("migrated config");
+        assert!(!cfg.cloud.contribute_enabled);
+        assert!(cfg.telemetry.explicitly_disabled());
     }
 }

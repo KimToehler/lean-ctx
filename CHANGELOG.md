@@ -5,6 +5,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed — anonymous product telemetry v2, on by default with notice
+
+- The opt-in v1 heartbeat is replaced by a strict, typed daily batch
+  (`telemetry_v2`). It is on by default, but nothing is sent until a one-time
+  notice has been shown in a terminal. `DO_NOT_TRACK`, `LEAN_CTX_TELEMETRY=off`,
+  CI, and `lean-ctx telemetry off` all stop it. An explicit earlier opt-out is
+  kept.
+- Sent: version, OS/arch, a random installation ID, and the AI client family.
+  Clients now come from the MCP handshake: Claude, Codex, Cursor, Gemini,
+  Windsurf, Zed, VS Code/Copilot, Kiro, Antigravity, CodeBuddy, CodeWhale.
+  The batch also carries the integration mode, the embeddings state, daily
+  call and failure counts per built-in lean-ctx tool, and coarse
+  session/sync/error aggregates. Never sent: prompts, code, file contents,
+  paths, commands, tool arguments, or foreign MCP tool names. Every field is a
+  closed enum or a bounded counter; see
+  `docs/privacy/TELEMETRY-DATA-DICTIONARY.md`.
+- `lean-ctx telemetry show|history|purge-local|delete-remote|reset-id`
+  inspects the exact pending payload and the local send ledger, and deletes
+  it locally or remotely.
+- Fixed: tool calls were never counted in production, so every usage
+  aggregate reported zero.
+
 ### Fixed — files in legacy Windows encodings are indexed
 
 - Source files that are not strict UTF-8 were skipped silently by every index:

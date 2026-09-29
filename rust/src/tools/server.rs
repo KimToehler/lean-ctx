@@ -100,6 +100,15 @@ pub struct LeanCtxServer {
     pub session: Arc<RwLock<SessionState>>,
     pub tool_calls: Arc<RwLock<Vec<ToolCallRecord>>>,
     pub call_count: Arc<AtomicUsize>,
+    /// Every tool call, counted unconditionally at the top of
+    /// `call_tool_guarded`.
+    ///
+    /// `call_count` only advances inside `record_checkpoint`, which returns
+    /// early whenever checkpointing is skipped — and `minimal_overhead`
+    /// (default `true`) skips it for every tool. Anything scheduled off
+    /// `call_count` therefore never runs in a default install. The daily
+    /// telemetry flush was scheduled that way and consequently never sent.
+    pub background_tick: Arc<AtomicUsize>,
     pub pro_trigger_check_count: Arc<AtomicUsize>,
     pub cache_ttl_secs: u64,
     pub last_call: Arc<RwLock<Instant>>,

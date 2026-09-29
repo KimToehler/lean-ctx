@@ -191,35 +191,43 @@ fn cmd_sync_index(args: &[String]) {
     let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
     match sub {
-        "push" => match cloud_client::push_index_bundle(&root) {
-            Ok((project_hash, bytes)) => {
-                println!(
-                    "\x1b[32m✓\x1b[0m Index pushed ({:.1} MB encrypted, project {})",
-                    bytes as f64 / 1_048_576.0,
-                    &project_hash[..12.min(project_hash.len())]
-                );
-                println!("  Pull on any device: lean-ctx sync index pull");
+        "push" => {
+            let result = cloud_client::push_index_bundle(&root);
+            record_sync_telemetry(&result);
+            match result {
+                Ok((project_hash, bytes)) => {
+                    println!(
+                        "\x1b[32m✓\x1b[0m Index pushed ({:.1} MB encrypted, project {})",
+                        bytes as f64 / 1_048_576.0,
+                        &project_hash[..12.min(project_hash.len())]
+                    );
+                    println!("  Pull on any device: lean-ctx sync index pull");
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31m✗\x1b[0m {e}");
+                    std::process::exit(1);
+                }
             }
-            Err(e) => {
-                eprintln!("\x1b[31m✗\x1b[0m {e}");
-                std::process::exit(1);
+        }
+        "pull" => {
+            let result = cloud_client::pull_index_bundle(&root);
+            record_sync_telemetry(&result);
+            match result {
+                Ok(manifest) => {
+                    println!(
+                        "\x1b[32m✓\x1b[0m Index restored ({} files, built {} by v{})",
+                        manifest.files.len(),
+                        manifest.created_at,
+                        manifest.engine_version
+                    );
+                    println!("  Semantic search is ready — no local re-index needed.");
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31m✗\x1b[0m {e}");
+                    std::process::exit(1);
+                }
             }
-        },
-        "pull" => match cloud_client::pull_index_bundle(&root) {
-            Ok(manifest) => {
-                println!(
-                    "\x1b[32m✓\x1b[0m Index restored ({} files, built {} by v{})",
-                    manifest.files.len(),
-                    manifest.created_at,
-                    manifest.engine_version
-                );
-                println!("  Semantic search is ready — no local re-index needed.");
-            }
-            Err(e) => {
-                eprintln!("\x1b[31m✗\x1b[0m {e}");
-                std::process::exit(1);
-            }
-        },
+        }
         "status" => match cloud_client::index_bundle_status() {
             Ok(v) => {
                 let used_mb = v["used_bytes"].as_u64().unwrap_or(0) as f64 / 1_048_576.0;
@@ -305,7 +313,9 @@ fn sync_personal_cloud(store: &core::stats::StatsStore) -> CloudSyncOutcome {
     if entries.is_empty() {
         println!("  No stats to sync yet.");
     } else {
-        match cloud_client::sync_stats(&entries) {
+        let result = cloud_client::sync_stats(&entries);
+        record_sync_telemetry(&result);
+        match result {
             Ok(_) => println!("  Stats: synced"),
             Err(e) if pro_gate_hit(&e) => return CloudSyncOutcome::Gated,
             Err(e) => tracing::error!("Stats sync failed: {e}"),
@@ -317,7 +327,9 @@ fn sync_personal_cloud(store: &core::stats::StatsStore) -> CloudSyncOutcome {
     if command_entries.is_empty() {
         println!("  No command data to sync.");
     } else {
-        match cloud_client::push_commands(&command_entries) {
+        let result = cloud_client::push_commands(&command_entries);
+        record_sync_telemetry(&result);
+        match result {
             Ok(_) => println!("  Commands: synced"),
             Err(e) if pro_gate_hit(&e) => return CloudSyncOutcome::Gated,
             Err(e) => tracing::error!("Commands sync failed: {e}"),
@@ -329,7 +341,9 @@ fn sync_personal_cloud(store: &core::stats::StatsStore) -> CloudSyncOutcome {
     if cep_entries.is_empty() {
         println!("  No CEP sessions to sync.");
     } else {
-        match cloud_client::push_cep(&cep_entries) {
+        let result = cloud_client::push_cep(&cep_entries);
+        record_sync_telemetry(&result);
+        match result {
             Ok(_) => println!("  CEP: synced"),
             Err(e) if pro_gate_hit(&e) => return CloudSyncOutcome::Gated,
             Err(e) => tracing::error!("CEP sync failed: {e}"),
@@ -341,7 +355,9 @@ fn sync_personal_cloud(store: &core::stats::StatsStore) -> CloudSyncOutcome {
     if knowledge_entries.is_empty() {
         println!("  No knowledge to sync.");
     } else {
-        match cloud_client::push_knowledge(&knowledge_entries) {
+        let result = cloud_client::push_knowledge(&knowledge_entries);
+        record_sync_telemetry(&result);
+        match result {
             Ok(_) => println!("  Knowledge: synced"),
             Err(e) if pro_gate_hit(&e) => return CloudSyncOutcome::Gated,
             Err(e) => tracing::error!("Knowledge sync failed: {e}"),
@@ -353,7 +369,9 @@ fn sync_personal_cloud(store: &core::stats::StatsStore) -> CloudSyncOutcome {
     if gotcha_entries.is_empty() {
         println!("  No gotchas to sync.");
     } else {
-        match cloud_client::push_gotchas(&gotcha_entries) {
+        let result = cloud_client::push_gotchas(&gotcha_entries);
+        record_sync_telemetry(&result);
+        match result {
             Ok(_) => println!("  Gotchas: synced"),
             Err(e) if pro_gate_hit(&e) => return CloudSyncOutcome::Gated,
             Err(e) => tracing::error!("Gotchas sync failed: {e}"),
@@ -365,7 +383,9 @@ fn sync_personal_cloud(store: &core::stats::StatsStore) -> CloudSyncOutcome {
     if feedback_entries.is_empty() {
         println!("  No feedback thresholds to sync.");
     } else {
-        match cloud_client::push_feedback(&feedback_entries) {
+        let result = cloud_client::push_feedback(&feedback_entries);
+        record_sync_telemetry(&result);
+        match result {
             Ok(_) => println!("  Feedback: synced"),
             Err(e) if pro_gate_hit(&e) => return CloudSyncOutcome::Gated,
             Err(e) => tracing::error!("Feedback sync failed: {e}"),
@@ -384,6 +404,18 @@ fn print_pro_upgrade_hint() {
     println!("Synchronization is not included in this account's plan.");
     println!("Your local context is unchanged and keeps working.");
     println!("Plan details: https://leanctx.com/account/billing/ · help: hello@leanctx.com");
+}
+
+fn record_sync_telemetry<T>(result: &Result<T, String>) {
+    if let Err(error) = core::telemetry_aggregate::record_sync_result(result.is_ok()) {
+        tracing::debug!("telemetry sync aggregate unavailable: {error}");
+    }
+}
+
+fn record_sync_outcome(success: bool) {
+    if let Err(error) = core::telemetry_aggregate::record_sync_result(success) {
+        tracing::debug!("telemetry sync aggregate unavailable: {error}");
+    }
 }
 
 fn build_sync_entries(store: &core::stats::StatsStore) -> Vec<serde_json::Value> {
@@ -508,17 +540,19 @@ pub fn cmd_cloud(args: &[String]) {
     match action {
         "pull-models" => {
             println!("Updating adaptive models...");
-            match cloud_client::pull_cloud_models() {
+            let result = cloud_client::pull_cloud_models().and_then(|data| {
+                cloud_client::save_cloud_models(&data)
+                    .map(|()| data)
+                    .map_err(|error| error.to_string())
+            });
+            record_sync_telemetry(&result);
+            match result {
                 Ok(data) => {
                     let count = data
                         .get("models")
                         .and_then(|v| v.as_array())
                         .map_or(0, std::vec::Vec::len);
 
-                    if let Err(e) = cloud_client::save_cloud_models(&data) {
-                        tracing::warn!("Could not save models: {e}");
-                        return;
-                    }
                     println!("{count} adaptive models updated.");
                     if let Some(est) = data
                         .get("improvement_estimate")
@@ -759,16 +793,19 @@ fn cmd_cloud_pull() {
     let entries = match cloud_client::pull_knowledge() {
         Ok(e) => e,
         Err(e) if pro_gate_hit(&e) => {
+            record_sync_outcome(false);
             print_pro_upgrade_hint();
             std::process::exit(1);
         }
         Err(e) => {
+            record_sync_outcome(false);
             tracing::error!("Pull failed: {e}");
             std::process::exit(1);
         }
     };
 
     if entries.is_empty() {
+        record_sync_outcome(true);
         println!(
             "No cloud knowledge to restore yet. Run `lean-ctx sync` on another machine first."
         );
@@ -778,6 +815,7 @@ fn cmd_cloud_pull() {
     let facts = match parse_pulled_knowledge(&entries) {
         Ok(f) => f,
         Err(e) => {
+            record_sync_outcome(false);
             tracing::error!("Could not parse pulled knowledge: {e}");
             std::process::exit(1);
         }
@@ -786,6 +824,7 @@ fn cmd_cloud_pull() {
     let policy = match crate::tools::knowledge_shared::load_policy_or_error() {
         Ok(p) => p,
         Err(e) => {
+            record_sync_outcome(false);
             eprintln!("{e}");
             std::process::exit(1);
         }
@@ -803,6 +842,7 @@ fn cmd_cloud_pull() {
         )
     }) {
         Ok((_, result)) => {
+            record_sync_outcome(true);
             println!(
                 "  Knowledge: {} restored, {} already present (into {project_root})",
                 result.added, result.skipped
@@ -810,6 +850,7 @@ fn cmd_cloud_pull() {
             println!("Pull complete.");
         }
         Err(e) => {
+            record_sync_outcome(false);
             tracing::error!("Knowledge restore failed: {e}");
             std::process::exit(1);
         }
@@ -867,6 +908,9 @@ fn cloud_upgrade(args: &[String]) {
     println!("Starting {plan} checkout ({interval})...");
     match cloud_client::start_checkout(&plan, &interval) {
         Ok(url) => {
+            if let Err(error) = crate::core::telemetry_aggregate::record_checkout_started() {
+                tracing::debug!("telemetry checkout aggregate unavailable: {error}");
+            }
             println!();
             println!("Open this link to complete your subscription:");
             println!("  {url}");

@@ -13,23 +13,38 @@ use super::schema::{ConfigSchema, KeySchema};
 ///
 /// Returns the updated `Config` on success, or a user-friendly error message.
 pub fn set_by_key(key: &str, value: &str) -> Result<Config, crate::core::error::ConfigError> {
-    let schema = ConfigSchema::generate();
-    let key_schema =
-        schema
-            .lookup(key)
-            .ok_or_else(|| crate::core::error::ConfigError::UnknownKey {
-                key: key.to_string(),
-            })?;
+    set_many_by_key(&[(key, value)])
+}
 
+/// Atomically validates and persists several schema-known keys.
+///
+/// The config file is written only after every key and value has passed schema
+/// validation and the resulting document deserializes into [`Config`].
+pub fn set_many_by_key(
+    updates: &[(&str, &str)],
+) -> Result<Config, crate::core::error::ConfigError> {
+    let schema = ConfigSchema::generate();
     let mut table = load_config_as_table()?;
-    let toml_value = parse_value(value, key_schema)?;
-    set_nested(&mut table, key, toml_value)?;
+    for (key, value) in updates {
+        let key_schema =
+            schema
+                .lookup(key)
+                .ok_or_else(|| crate::core::error::ConfigError::UnknownKey {
+                    key: (*key).to_string(),
+                })?;
+        let toml_value = parse_value(value, key_schema)?;
+        set_nested(&mut table, key, toml_value)?;
+    }
 
     let cfg: Config = toml::Value::Table(table)
         .try_into()
         .map_err(
             |e: toml::de::Error| crate::core::error::ConfigError::InvalidValue {
-                key: key.to_string(),
+                key: updates
+                    .iter()
+                    .map(|(key, _)| *key)
+                    .collect::<Vec<_>>()
+                    .join(","),
                 message: e.to_string(),
             },
         )?;

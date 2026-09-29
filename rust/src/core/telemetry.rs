@@ -1,6 +1,7 @@
 //! Telemetry and metrics collection following OpenTelemetry GenAI conventions.
 //!
-//! Provides lock-free, zero-allocation metrics collection for:
+//! Provides zero-allocation metrics collection with a short consistency lock
+//! around tool-call counters so daily snapshots cannot lose partial updates:
 //! - Token usage (input, output, saved, compression ratio)
 //! - Tool call latency and success rates
 //! - Search quality metrics (latency, result counts)
@@ -10,11 +11,22 @@
 //! Naming follows the OpenTelemetry GenAI Semantic Conventions:
 //! <https://opentelemetry.io/docs/specs/semconv/gen-ai/>
 
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 static METRICS: OnceLock<Metrics> = OnceLock::new();
+
+pub(crate) const TOOL_LATENCY_BUCKET_UPPER_MS: [u64; 9] =
+    [10, 50, 100, 250, 500, 1_000, 5_000, 60_000, i64::MAX as u64];
+
+/// Calls and failures of one tool since process start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ToolCallCounter {
+    pub calls: u64,
+    pub failures: u64,
+}
 
 pub fn global_metrics() -> &'static Metrics {
     METRICS.get_or_init(Metrics::new)
@@ -22,6 +34,10 @@ pub fn global_metrics() -> &'static Metrics {
 
 #[derive(Debug)]
 pub struct Metrics {
+    /// Guards the tool-call counters so a daily snapshot never sees a
+    /// half-applied call, and holds the per-tool counts. Keys are the static
+    /// names of the built-in tool registry, never caller-supplied strings.
+    tool_call_consistency: std::sync::Mutex<BTreeMap<&'static str, ToolCallCounter>>,
     // gen_ai.usage.input_tokens / gen_ai.usage.output_tokens
     pub tokens_input: AtomicU64,
     pub tokens_output: AtomicU64,
@@ -30,6 +46,7 @@ pub struct Metrics {
     pub tool_calls_total: AtomicU64,
     pub tool_calls_error: AtomicU64,
     pub tool_call_latency_sum_us: AtomicU64,
+    tool_call_latency_buckets: [AtomicU64; TOOL_LATENCY_BUCKET_UPPER_MS.len()],
 
     pub search_queries_total: AtomicU64,
     pub search_latency_sum_us: AtomicU64,
@@ -52,12 +69,14 @@ pub struct Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self {
+            tool_call_consistency: std::sync::Mutex::new(BTreeMap::new()),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             tokens_saved: AtomicU64::new(0),
             tool_calls_total: AtomicU64::new(0),
             tool_calls_error: AtomicU64::new(0),
             tool_call_latency_sum_us: AtomicU64::new(0),
+            tool_call_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             search_queries_total: AtomicU64::new(0),
             search_latency_sum_us: AtomicU64::new(0),
             search_results_total: AtomicU64::new(0),
@@ -80,9 +99,39 @@ impl Metrics {
     }
 
     pub fn record_tool_call(&self, latency_us: u64, success: bool) {
+        let guard = self
+            .tool_call_consistency
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.record_tool_call_locked(latency_us, success);
+        drop(guard);
+    }
+
+    /// Record a call of a built-in tool: the totals and the tool's own counter
+    /// move together under one lock.
+    pub fn record_named_tool_call(&self, tool: &'static str, latency_us: u64, success: bool) {
+        let mut per_tool = self
+            .tool_call_consistency
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.record_tool_call_locked(latency_us, success);
+        let counter = per_tool.entry(tool).or_default();
+        counter.calls = counter.calls.saturating_add(1);
+        if !success {
+            counter.failures = counter.failures.saturating_add(1);
+        }
+    }
+
+    fn record_tool_call_locked(&self, latency_us: u64, success: bool) {
         self.tool_calls_total.fetch_add(1, Ordering::Relaxed);
         self.tool_call_latency_sum_us
             .fetch_add(latency_us, Ordering::Relaxed);
+        let latency_ms = latency_us / 1_000;
+        let bucket = TOOL_LATENCY_BUCKET_UPPER_MS
+            .iter()
+            .position(|upper| latency_ms <= *upper)
+            .unwrap_or(TOOL_LATENCY_BUCKET_UPPER_MS.len() - 1);
+        self.tool_call_latency_buckets[bucket].fetch_add(1, Ordering::Relaxed);
         if !success {
             self.tool_calls_error.fetch_add(1, Ordering::Relaxed);
         }
@@ -178,6 +227,22 @@ impl Metrics {
         }
     }
 
+    pub(crate) fn daily_telemetry_snapshot(&self) -> DailyTelemetrySnapshot {
+        let per_tool = self
+            .tool_call_consistency
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        DailyTelemetrySnapshot {
+            per_tool: per_tool.clone(),
+            tool_calls: self.tool_calls_total.load(Ordering::Relaxed),
+            tool_failures: self.tool_calls_error.load(Ordering::Relaxed),
+            tool_latency_buckets: std::array::from_fn(|index| {
+                self.tool_call_latency_buckets[index].load(Ordering::Relaxed)
+            }),
+            session_uptime_secs: self.session_start.elapsed().as_secs(),
+        }
+    }
+
     /// Format as OpenTelemetry-compatible attributes for logging.
     pub fn to_otel_attributes(&self) -> Vec<(&'static str, String)> {
         let snap = self.snapshot();
@@ -227,6 +292,15 @@ impl Metrics {
             ),
         ]
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DailyTelemetrySnapshot {
+    pub tool_calls: u64,
+    pub tool_failures: u64,
+    pub tool_latency_buckets: [u64; TOOL_LATENCY_BUCKET_UPPER_MS.len()],
+    pub session_uptime_secs: u64,
+    pub per_tool: BTreeMap<&'static str, ToolCallCounter>,
 }
 
 /// Point-in-time snapshot of all metrics.
@@ -561,6 +635,65 @@ mod tests {
         assert_eq!(snap.tool_calls_total, 2);
         assert_eq!(snap.tool_calls_error, 1);
         assert!(snap.tool_call_avg_latency_ms > 0.0);
+    }
+
+    #[test]
+    fn named_tool_call_moves_totals_and_per_tool_counter_together() {
+        let m = Metrics::new();
+        m.record_named_tool_call("ctx_read", 1_000, true);
+        m.record_named_tool_call("ctx_read", 2_000, false);
+        m.record_named_tool_call("ctx_shell", 3_000, true);
+
+        let snap = m.daily_telemetry_snapshot();
+        assert_eq!(snap.tool_calls, 3);
+        assert_eq!(snap.tool_failures, 1);
+        assert_eq!(
+            snap.per_tool.get("ctx_read"),
+            Some(&ToolCallCounter {
+                calls: 2,
+                failures: 1
+            })
+        );
+        assert_eq!(
+            snap.per_tool.get("ctx_shell"),
+            Some(&ToolCallCounter {
+                calls: 1,
+                failures: 0
+            })
+        );
+    }
+
+    #[test]
+    fn concurrent_daily_snapshot_never_observes_partial_tool_call() {
+        let metrics = std::sync::Arc::new(Metrics::new());
+        let writers = (0..4)
+            .map(|worker| {
+                let metrics = std::sync::Arc::clone(&metrics);
+                std::thread::spawn(move || {
+                    for call in 0..1_000 {
+                        metrics.record_tool_call((call + 1) * 1_000, (call + worker) % 3 != 0);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        while writers.iter().any(|writer| !writer.is_finished()) {
+            let snapshot = metrics.daily_telemetry_snapshot();
+            assert_eq!(
+                snapshot.tool_latency_buckets.iter().sum::<u64>(),
+                snapshot.tool_calls
+            );
+            assert!(snapshot.tool_failures <= snapshot.tool_calls);
+        }
+        for writer in writers {
+            writer.join().expect("writer");
+        }
+        let snapshot = metrics.daily_telemetry_snapshot();
+        assert_eq!(snapshot.tool_calls, 4_000);
+        assert_eq!(
+            snapshot.tool_latency_buckets.iter().sum::<u64>(),
+            snapshot.tool_calls
+        );
+        assert!(snapshot.tool_failures <= snapshot.tool_calls);
     }
 
     #[test]

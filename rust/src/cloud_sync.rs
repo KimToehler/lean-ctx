@@ -80,12 +80,15 @@ pub fn cloud_background_tasks() {
     // project-local override into the global config (#443).
     let mut config = Config::load_global();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let telemetry_bucket = crate::core::telemetry_aggregate::current_send_bucket();
 
     let already_heartbeated = config
         .telemetry
         .last_heartbeat
         .as_deref()
-        .is_some_and(|d| d == today);
+        .is_some_and(|d| d == telemetry_bucket)
+        || crate::core::telemetry_aggregate::last_sent_bucket().as_deref()
+            == Some(telemetry_bucket.as_str());
     let already_synced = config
         .cloud
         .last_sync
@@ -103,26 +106,55 @@ pub fn cloud_background_tasks() {
         .is_some_and(|d| d == today);
 
     // Unified anonymous telemetry: heartbeat + contribute entries in one request.
-    if config.telemetry.enabled && !already_heartbeated {
-        if let Ok(id) = crate::core::installation_id::get_or_create() {
-            let contribute = collect_contribute_entries();
-            let payload = serde_json::json!({
-                "installation_id": id,
-                "version": env!("CARGO_PKG_VERSION"),
-                "os": std::env::consts::OS,
-                "arch": std::env::consts::ARCH,
-                "contribute_entries": contribute,
-            });
-            if crate::cloud_client::heartbeat(&payload).is_ok() {
-                config.telemetry.last_heartbeat = Some(today.clone());
-                let record = crate::core::telemetry_ledger::HeartbeatRecord {
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    installation_id: id.clone(),
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                    os: std::env::consts::OS.to_string(),
-                    arch: std::env::consts::ARCH.to_string(),
-                };
-                let _ = crate::core::telemetry_ledger::append(&record);
+    let do_not_track = std::env::var("DO_NOT_TRACK").ok();
+    let telemetry_override = std::env::var("LEAN_CTX_TELEMETRY").ok();
+    let telemetry_eligible = config
+        .telemetry
+        .send_eligible(do_not_track.as_deref(), telemetry_override.as_deref());
+    if telemetry_eligible
+        && let Err(error) = crate::core::telemetry_aggregate::record_current_version()
+    {
+        tracing::debug!("telemetry version aggregate unavailable: {error}");
+    }
+    if telemetry_eligible && !already_heartbeated {
+        if let Ok(lease) = crate::core::telemetry_aggregate::begin_daily_send() {
+            let batch = lease.batch().clone();
+            let installation_id = batch
+                .events
+                .first()
+                .map(|event| event.installation_id.clone());
+            if let Ok(payload) = serde_json::to_vec(&batch)
+                && crate::cloud_client::telemetry_v2_batch(&batch).is_ok()
+            {
+                use sha2::Digest;
+                let payload_hash = hex::encode(sha2::Sha256::digest(payload));
+                let record = installation_id.map(|installation_id| {
+                    crate::core::telemetry_ledger::HeartbeatRecord {
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        installation_id,
+                        version: env!("CARGO_PKG_VERSION").to_string(),
+                        os: std::env::consts::OS.to_string(),
+                        arch: std::env::consts::ARCH.to_string(),
+                        schema_version: batch.schema_version,
+                        event_names: batch
+                            .events
+                            .iter()
+                            .map(|event| event.event.name().to_string())
+                            .collect(),
+                        payload_hash,
+                        endpoint: telemetry_ledger_endpoint(),
+                        status: "success".to_string(),
+                    }
+                });
+                let ledger_committed = record
+                    .as_ref()
+                    .is_some_and(|record| crate::core::telemetry_ledger::append(record).is_ok());
+                if ledger_committed && lease.commit().is_ok() {
+                    config.telemetry.last_heartbeat = batch
+                        .events
+                        .first()
+                        .map(|event| event.timestamp_bucket.clone());
+                }
             }
         }
     }
@@ -131,8 +163,12 @@ pub fn cloud_background_tasks() {
         if config.cloud.sync_stats_enabled && !already_synced {
             let store = crate::core::stats::load();
             let entries = build_sync_entries(&store);
-            if !entries.is_empty() && crate::cloud_client::sync_stats(&entries).is_ok() {
-                config.cloud.last_sync = Some(today.clone());
+            if !entries.is_empty() {
+                let result = crate::cloud_client::sync_stats(&entries);
+                record_sync_telemetry(&result);
+                if result.is_ok() {
+                    config.cloud.last_sync = Some(today.clone());
+                }
             }
         }
 
@@ -157,17 +193,21 @@ pub fn cloud_background_tasks() {
                 "tool_spend_usd": summary.tool_spend_usd,
                 "model_key": summary.model.model_key,
             });
-            if crate::cloud_client::push_gain(&[entry]).is_ok() {
+            let result = crate::cloud_client::push_gain(&[entry]);
+            record_sync_telemetry(&result);
+            if result.is_ok() {
                 config.cloud.last_gain_sync = Some(today.clone());
             }
         }
 
-        if config.cloud.sync_models_enabled
-            && !already_pulled
-            && let Ok(data) = crate::cloud_client::pull_cloud_models()
-        {
-            let _ = crate::cloud_client::save_cloud_models(&data);
-            config.cloud.last_model_pull = Some(today.clone());
+        if config.cloud.sync_models_enabled && !already_pulled {
+            let result = crate::cloud_client::pull_cloud_models().and_then(|data| {
+                crate::cloud_client::save_cloud_models(&data).map_err(|error| error.to_string())
+            });
+            record_sync_telemetry(&result);
+            if result.is_ok() {
+                config.cloud.last_model_pull = Some(today.clone());
+            }
         }
 
         // Opt-in Personal-Cloud auto-push (GL #384): silent, once per day,
@@ -200,7 +240,9 @@ pub fn cloud_background_tasks() {
                     .map(String::as_str),
                 &today,
             ) {
-                match crate::cloud_client::push_index_bundle(&root) {
+                let result = crate::cloud_client::push_index_bundle(&root);
+                record_sync_telemetry(&result);
+                match result {
                     Ok((hash, bytes)) => {
                         tracing::debug!(project = %hash, bytes, "auto-index: pushed");
                         config
@@ -228,20 +270,44 @@ pub fn cloud_background_tasks() {
     }
 }
 
+fn telemetry_ledger_endpoint() -> String {
+    let raw =
+        std::env::var("LEAN_CTX_API_URL").unwrap_or_else(|_| "https://api.leanctx.com".to_string());
+    sanitized_telemetry_endpoint(&raw)
+}
+
+fn sanitized_telemetry_endpoint(raw: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return "https://api.leanctx.com/api/telemetry/v2/batch".to_string();
+    };
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return "https://api.leanctx.com/api/telemetry/v2/batch".to_string();
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.set_path("/api/telemetry/v2/batch");
+    url.to_string()
+}
+
 /// Push every Personal-Cloud surface silently (background variant of
 /// `lean-ctx sync`'s interactive flow — tracing instead of stdout).
 fn auto_sync_personal_cloud() -> AutoSyncOutcome {
     let store = crate::core::stats::load();
     let mut results: Vec<Result<(), String>> = Vec::new();
 
-    let mut push = |label: &str, result: Result<String, String>| match result {
-        Ok(_) => {
-            tracing::debug!(surface = label, "auto-sync: pushed");
-            results.push(Ok(()));
-        }
-        Err(e) => {
-            tracing::debug!(surface = label, error = %e, "auto-sync: push failed");
-            results.push(Err(e));
+    let mut push = |label: &str, result: Result<String, String>| {
+        record_sync_telemetry(&result);
+        match result {
+            Ok(_) => {
+                tracing::debug!(surface = label, "auto-sync: pushed");
+                results.push(Ok(()));
+            }
+            Err(e) => {
+                tracing::debug!(surface = label, error = %e, "auto-sync: push failed");
+                results.push(Err(e));
+            }
         }
     };
 
@@ -299,6 +365,12 @@ fn auto_sync_personal_cloud() -> AutoSyncOutcome {
     }
 
     outcome
+}
+
+fn record_sync_telemetry<T>(result: &Result<T, String>) {
+    if let Err(error) = crate::core::telemetry_aggregate::record_sync_result(result.is_ok()) {
+        tracing::debug!("telemetry sync aggregate unavailable: {error}");
+    }
 }
 
 pub fn build_sync_entries(store: &crate::core::stats::StatsStore) -> Vec<serde_json::Value> {
@@ -644,6 +716,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn telemetry_ledger_endpoint_removes_credentials_query_and_fragment() {
+        assert_eq!(
+            sanitized_telemetry_endpoint("https://user:secret@example.test/base?token=x#private"),
+            "https://example.test/api/telemetry/v2/batch"
+        );
+        assert_eq!(
+            sanitized_telemetry_endpoint("file:///private/path"),
+            "https://api.leanctx.com/api/telemetry/v2/batch"
+        );
+    }
+
+    #[test]
     fn auto_sync_requires_flag_login_and_unused_slot() {
         // Disabled flag blocks everything else.
         assert!(!should_auto_sync(false, true, None, "2026-06-10"));
@@ -716,7 +800,7 @@ mod tests {
             ]),
             AutoSyncOutcome::Gated
         );
-        // All failed without a 402 → offline, keep the slot open.
+        // All failed without a 401 or 402 → offline, keep the slot open.
         assert_eq!(
             classify_outcomes(&[Err("connection refused".into()), Err("timeout".into()),]),
             AutoSyncOutcome::NetworkFailure

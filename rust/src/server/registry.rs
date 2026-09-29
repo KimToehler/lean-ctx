@@ -47,6 +47,13 @@ impl ToolRegistry {
         self.tools.contains_key(name)
     }
 
+    /// The registry's own `'static` key for `name`, if it is a registered tool.
+    /// Telemetry counts per tool only under these keys, so a caller-supplied
+    /// string never reaches a counter.
+    pub fn static_name(&self, name: &str) -> Option<&'static str> {
+        self.tools.get_key_value(name).map(|(key, _)| *key)
+    }
+
     /// Returns MCP Tool definitions in the official public surface.
     ///
     /// Deprecated aliases and local-only collaboration compatibility tools

@@ -182,6 +182,10 @@ pub(super) fn run_mcp_server() -> Result<()> {
                 }
             }
         }
+        // Calls since the last periodic fold would otherwise die with the process.
+        if let Err(error) = core::telemetry_aggregate::persist_process_counters() {
+            tracing::debug!("telemetry counters not persisted at shutdown: {error}");
+        }
 
         server_handle.shutdown().await;
 
@@ -351,6 +355,9 @@ fn spawn_parent_watchdog() {
                         // Same flush set as the clean shutdown path (#550) — the
                         // hand-rolled copy here used to miss the predictor + feedback.
                         core::tool_lifecycle::flush_all();
+                        if let Err(error) = core::telemetry_aggregate::persist_process_counters() {
+                            tracing::debug!("telemetry counters not persisted at exit: {error}");
+                        }
                         std::process::exit(0);
                     }
                 }

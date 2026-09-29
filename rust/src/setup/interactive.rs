@@ -83,6 +83,7 @@ pub fn run_setup() {
     let mut not_installed: Vec<&str> = Vec::new();
     let mut mcp_skipped: Vec<&str> = Vec::new();
     let mut errors: Vec<&str> = Vec::new();
+    let mut configured_integration_ids = Vec::new();
 
     for target in &targets {
         let short_path = shorten_path(&target.config_path.to_string_lossy(), &home_str);
@@ -121,6 +122,7 @@ pub fn run_setup() {
                     target.name
                 ));
                 already_configured.push(target.name);
+                configured_integration_ids.push(target.agent_key.clone());
             }
             Ok(_) => {
                 terminal_ui::print_status_new(&format!(
@@ -128,6 +130,7 @@ pub fn run_setup() {
                     target.name
                 ));
                 newly_configured.push(target.name);
+                configured_integration_ids.push(target.agent_key.clone());
             }
             Err(e) => {
                 terminal_ui::print_status_warn(&format!("{}: {e}", target.name));
@@ -605,6 +608,14 @@ pub fn run_setup() {
     println!();
     terminal_ui::print_logo_animated();
     terminal_ui::print_command_box();
+
+    if errors.is_empty() {
+        if let Err(error) =
+            crate::core::telemetry_aggregate::record_setup_completion(configured_integration_ids)
+        {
+            tracing::debug!("telemetry setup aggregate unavailable: {error}");
+        }
+    }
 
     crate::cli::show_first_run_wow();
 }

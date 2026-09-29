@@ -664,10 +664,26 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
             "Enable anonymous telemetry heartbeat (version, OS, arch, random install ID — no code or PII)",
         ),
     );
+    telemetry.insert(
+        "preference".into(),
+        key_enum(
+            &["default_on", "explicitly_enabled", "explicitly_disabled"],
+            "default_on",
+            "Whether telemetry is using the v4 default or an explicit user choice",
+        ),
+    );
+    telemetry.insert(
+        "notice_shown".into(),
+        key(
+            "bool",
+            serde_json::json!(cfg.telemetry.notice_shown),
+            "Whether the one-time v4 telemetry disclosure has been processed",
+        ),
+    );
     sections.insert(
         "telemetry".into(),
         SectionSchema {
-            description: "Anonymous opt-in telemetry heartbeat".into(),
+            description: "Privacy-safe default-on telemetry with explicit opt-out".into(),
             keys: telemetry,
         },
     );

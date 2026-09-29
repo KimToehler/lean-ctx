@@ -24,6 +24,8 @@ _lean_ctx_passthrough() {
 
 compdef _lean-ctx lean-ctx 2>/dev/null
 compdef _lean-ctx lctx 2>/dev/null
+compdef _lean_ctx_passthrough lean_ctx_track 2>/dev/null
+compdef _lean_ctx_passthrough lean_ctx_compress 2>/dev/null
 compdef _lean_ctx_passthrough _lc 2>/dev/null
 compdef _lean_ctx_passthrough _lc_compress 2>/dev/null
 "#
@@ -41,7 +43,7 @@ pub(super) fn bash_script() -> String {
 # Wrapper aliases delegate to the original command's native completion.
 _lean_ctx_passthrough() {
     local cmd="${COMP_WORDS[0]}"
-    # Resolve the underlying command (strip _lc/_lc_compress wrapper).
+    # Resolve the underlying command (strip lean_ctx_track/lean_ctx_compress wrapper).
     _completion_loader "$cmd" 2>/dev/null
     local func
     func=$(complete -p "$cmd" 2>/dev/null | sed 's/.*-F \([^ ]*\).*/\1/')

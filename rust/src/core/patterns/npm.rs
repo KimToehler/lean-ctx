@@ -80,7 +80,7 @@ fn compress_install(output: &str) -> String {
         format!(", {time})")
     };
 
-    if pkg_str.is_empty() && dep_count > 0 {
+    let summary = if pkg_str.is_empty() && dep_count > 0 {
         format!(
             "ok ({dep_count} deps{}",
             if time.is_empty() {
@@ -91,6 +91,35 @@ fn compress_install(output: &str) -> String {
         )
     } else {
         format!("{pkg_str}{dep_str}{time_str}")
+    };
+    with_install_advisories(summary, output)
+}
+
+/// Security findings an install reports must reach the agent (#1894): the
+/// `N vulnerabilities (…)` summary and the remediation command that follows.
+/// "0 vulnerabilities" is noise and stays dropped.
+pub(super) fn install_advisories(output: &str) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let t = line.trim();
+        let lower = t.to_ascii_lowercase();
+        let is_vuln_summary = lower.contains("vulnerabilit")
+            && t.split_whitespace()
+                .any(|w| w.parse::<u32>().is_ok_and(|n| n > 0));
+        let is_fix_hint = lower.contains("audit fix") || lower.contains("audit --fix");
+        if (is_vuln_summary || is_fix_hint) && !kept.iter().any(|k| k == t) {
+            kept.push(t.to_string());
+        }
+    }
+    kept
+}
+
+pub(super) fn with_install_advisories(summary: String, output: &str) -> String {
+    let advisories = install_advisories(output);
+    if advisories.is_empty() {
+        summary
+    } else {
+        format!("{summary}\n{}", advisories.join("\n"))
     }
 }
 
@@ -314,4 +343,24 @@ fn compact_output(text: &str, max: usize) -> String {
         lines[..max].join("\n"),
         super::elision_marker(lines.len() - max)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compress;
+
+    #[test]
+    fn install_keeps_vulnerability_summary_and_fix_hint() {
+        let out = "added 847 packages, and audited 848 packages in 12s\n\n3 vulnerabilities (1 moderate, 2 high)\n\nTo address all issues, run:\n  npm audit fix\n";
+        assert_eq!(
+            compress("npm install", out).unwrap(),
+            "ok (847 deps, 12s)\n3 vulnerabilities (1 moderate, 2 high)\nnpm audit fix"
+        );
+    }
+
+    #[test]
+    fn install_drops_zero_vulnerabilities() {
+        let out = "added 2 packages, and audited 3 packages in 1s\n\nfound 0 vulnerabilities\n";
+        assert_eq!(compress("npm ci", out).unwrap(), "ok (2 deps, 1s)");
+    }
 }

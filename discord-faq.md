@@ -1,6 +1,6 @@
 # lean-ctx FAQ
 
-> **Latest version: 3.10.5** — complete MCP tool set · 10 read modes · 95+ shell patterns
+> **Latest version: 3.10.5** — complete MCP tool set · 16 read modes · 85+ shell patterns
 > Docs: https://leanctx.com/docs/getting-started
 
 ---
@@ -40,8 +40,8 @@ After updating, restart your shell (`source ~/.zshrc`) and your IDE.
 
 **Q: What does lean-ctx actually do?**
 lean-ctx sits between your AI tool and the system. It has two layers:
-1. **Shell Hook** — transparently compresses CLI output (git, ls, npm, cargo, etc.) using 95+ patterns before it reaches the LLM
-2. **MCP Server** — tools for cached file reads, 10 read modes, deltas, dedup, memory, multi-agent coordination, and more
+1. **Shell Hook** — transparently compresses CLI output (git, ls, npm, cargo, etc.) using 85+ patterns before it reaches the LLM
+2. **MCP Server** — tools for cached file reads, 16 read modes, deltas, dedup, memory, multi-agent coordination, and more
 
 Actual savings depend on the workload and enabled modes. Use `lean-ctx savings`
 for local observations and Shadow Mode for a comparable baseline.
@@ -52,7 +52,7 @@ for local observations and Shadow Mode for a comparable baseline.
 
 Both work together for maximum savings.
 
-**Q: What are the 10 read modes?**
+**Q: What are the 16 read modes?**
 | Mode | Use when... |
 |------|-------------|
 | `auto` | You don't know — lean-ctx picks the best mode |
@@ -64,7 +64,13 @@ Both work together for maximum savings.
 | `entropy` | Focus on high-information fragments |
 | `task` | Filtered by current task context |
 | `reference` | Minimal citation-style excerpts |
-| `lines:N-M` | Specific line range |
+| `lines:N-M` | Specific line range (`lines:5,10-20`, `lines:-N` tail) |
+| `anchored` | Full content with per-line anchors for `ctx_patch` edits |
+| `full-compact` | Full content without header, trailing whitespace stripped |
+| `raw` | Exact bytes, no framing |
+| `cognitive` | 7±2 semantic chunks of a long file |
+| `mdl` | Minimal structural description |
+| `density:X` | Highest-entropy lines until ~X of the tokens remain |
 
 **Q: Does lean-ctx send my code anywhere?**
 No. lean-ctx runs 100% locally. Zero telemetry. Your code never leaves your machine. The only exception is if you explicitly opt into `lean-ctx cloud` for cross-device sync.

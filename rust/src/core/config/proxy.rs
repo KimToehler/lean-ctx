@@ -543,12 +543,14 @@ pub enum ProseRole {
 /// Instead of configuring 8+ individual booleans, operators pick a single mode
 /// that resolves sensible defaults. Explicit per-knob overrides always win.
 ///
-/// - `Cache` (default): maximise provider prompt-cache hit rate. History is
+/// - `Cache`: maximise provider prompt-cache hit rate. History is
 ///   frozen at staircase boundaries, breakpoints are injected, volatile fields
 ///   are detected, and the live tail is compressed — but the prefix is never
 ///   rewritten.
-/// - `Token`: maximise raw token reduction. History may be rewritten, cold
-///   prefixes repacked, and volatile fields relocated. Best for short one-shot
+/// - `Token` (default for the knob presets): maximise raw token reduction.
+///   Cold prefixes may be repacked and volatile fields relocated. History is
+///   only rewritten (rolling) when `token` is chosen explicitly; an unset mode
+///   keeps cache-aware history pruning (#1895). Best for short one-shot
 ///   requests where cache reuse is unlikely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyMode {
@@ -645,9 +647,12 @@ impl ProxyConfig {
     }
 
     /// Resolved history mode: `LEAN_CTX_PROXY_HISTORY_MODE` env var wins,
-    /// then `[proxy].history_mode` in config.toml, then cache-aware.
+    /// then `[proxy].history_mode` in config.toml, then the preset of an
+    /// *explicitly chosen* `proxy_mode` (`token` → rolling, `cache` →
+    /// cache-aware), then cache-aware.
     /// Unknown values fall back to the default so a typo can never silently
-    /// re-enable the cache-hostile rolling mode.
+    /// re-enable the cache-hostile rolling mode — and neither can the implicit
+    /// `Token` default of [`Self::resolved_proxy_mode`] (#1895).
     pub fn resolved_history_mode(&self) -> HistoryMode {
         let raw = std::env::var("LEAN_CTX_PROXY_HISTORY_MODE")
             .ok()
@@ -660,9 +665,12 @@ impl ProxyConfig {
                 return HistoryMode::Off;
             }
         }
-        match self.resolved_proxy_mode() {
-            ProxyMode::Token => HistoryMode::Rolling,
-            ProxyMode::Cache => HistoryMode::CacheAware,
+        let explicit_mode = std::env::var("LEAN_CTX_PROXY_MODE")
+            .ok()
+            .or_else(|| self.proxy_mode.clone());
+        match explicit_mode.as_deref().and_then(ProxyMode::parse) {
+            Some(ProxyMode::Token) => HistoryMode::Rolling,
+            Some(ProxyMode::Cache) | None => HistoryMode::CacheAware,
         }
     }
 

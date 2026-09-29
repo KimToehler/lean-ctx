@@ -1,4 +1,4 @@
-use super::is_diff_or_stat_line;
+use super::{numstat_row_re, shortstat_line_re};
 
 pub(super) fn compress_log(command: &str, output: &str) -> String {
     let lines: Vec<&str> = output.lines().collect();
@@ -217,54 +217,69 @@ fn compress_log_with_patches(
 }
 
 fn compress_log_summary(lines: &[&str], max_entries: usize) -> String {
-    let has_diff = lines.iter().any(|l| l.starts_with("diff --git"));
-    let has_stat = lines
-        .iter()
-        .any(|l| l.contains(" | ") && l.trim().ends_with(['+', '-']));
-    let mut total_additions = 0u32;
-    let mut total_deletions = 0u32;
+    // Totals come only from sources git itself makes unambiguous (#1893):
+    // its `--stat`/`--shortstat` summary lines, `--numstat` rows, or `+`/`-`
+    // lines inside real `@@` hunks. Commit bodies are indented by four spaces
+    // and never counted — a markdown bullet (`- fix …`) is not a deletion.
+    let mut shortstat = ChangeTotals::default();
+    let mut numstat = ChangeTotals::default();
+    let mut hunks = ChangeTotals::default();
 
     let mut entries = Vec::new();
-    let mut in_diff = false;
+    let mut in_hunk = false;
     let mut got_message = false;
 
     for line in lines {
-        let trimmed = line.trim();
-
-        if trimmed.starts_with("commit ") {
-            let hash = &trimmed[7..14.min(trimmed.len())];
+        if line.starts_with("commit ") {
+            let hash = &line[7..14.min(line.len())];
             entries.push(hash.to_string());
-            in_diff = false;
+            in_hunk = false;
             got_message = false;
             continue;
         }
-
-        if trimmed.starts_with("Author:")
-            || trimmed.starts_with("Date:")
-            || trimmed.starts_with("Merge:")
-        {
+        if line.starts_with("diff --git") {
+            in_hunk = false;
+            hunks.seen = true;
             continue;
         }
-
-        if trimmed.starts_with("diff --git") || trimmed.starts_with("---") && trimmed.contains("a/")
-        {
-            in_diff = true;
+        if line.starts_with("@@") {
+            in_hunk = true;
+            continue;
         }
-
-        if in_diff || is_diff_or_stat_line(trimmed) {
-            if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
-                total_additions += 1;
-            } else if trimmed.starts_with('-') && !trimmed.starts_with("---") {
-                total_deletions += 1;
+        if in_hunk {
+            if line.starts_with('+') {
+                hunks.additions += 1;
+                continue;
             }
+            if line.starts_with('-') {
+                hunks.deletions += 1;
+                continue;
+            }
+            if line.starts_with(' ') || line.starts_with('\\') {
+                continue;
+            }
+            in_hunk = false;
+        }
+        if let Some(caps) = shortstat_line_re().captures(line) {
+            shortstat.seen = true;
+            shortstat.additions += capture_u32(&caps, 1);
+            shortstat.deletions += capture_u32(&caps, 2);
             continue;
         }
-
-        if trimmed.is_empty() {
+        if let Some(caps) = numstat_row_re().captures(line) {
+            numstat.seen = true;
+            numstat.additions += capture_u32(&caps, 1);
+            numstat.deletions += capture_u32(&caps, 2);
             continue;
         }
-
-        if !got_message {
+        let trimmed = line.trim();
+        let is_header = ["Author:", "Date:", "Merge:"]
+            .iter()
+            .any(|h| trimmed.starts_with(h));
+        // The subject is the first body line after the header block. git
+        // indents it by four spaces, but re-emitted logs may not — don't
+        // require the indent, or the subject silently disappears.
+        if !got_message && !is_header && !trimmed.is_empty() {
             if let Some(last) = entries.last_mut() {
                 *last = format!("{last} {trimmed}");
             }
@@ -287,12 +302,109 @@ fn compress_log_summary(lines: &[&str], max_entries: usize) -> String {
         entries.join("\n")
     };
 
-    if (has_diff || has_stat) && (total_additions > 0 || total_deletions > 0) {
+    let totals = [shortstat, numstat, hunks].into_iter().find(|t| t.seen);
+    if let Some(t) = totals.filter(|t| t.additions > 0 || t.deletions > 0) {
         result.push_str(&format!(
-            "\n[{} commits, +{total_additions}/-{total_deletions} total]",
-            entries.len()
+            "\n[{} commits, +{}/-{} total]",
+            entries.len(),
+            t.additions,
+            t.deletions
         ));
     }
 
     result
+}
+
+#[derive(Default, Clone, Copy)]
+struct ChangeTotals {
+    seen: bool,
+    additions: u32,
+    deletions: u32,
+}
+
+fn capture_u32(caps: &regex::Captures<'_>, idx: usize) -> u32 {
+    caps.get(idx)
+        .and_then(|m| m.as_str().parse().ok())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compress_log;
+
+    const BULLET_BODY_STAT: &str = "commit 8c93333c58aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Merge: efd449b d411020
+Author: A <a@example.com>
+Date:   Mon Sep 28 10:00:00 2026 +0200
+
+    Merge pull request #1883
+
+commit d4110207aabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+Author: A <a@example.com>
+Date:   Mon Sep 28 09:00:00 2026 +0200
+
+    refactor(updater): move release-asset selection
+
+    - moves platform matching
+    - drops the old helper
+    --- not a diff header either
+
+ rust/src/updater/mod.rs      | 40 +++++-----------
+ rust/src/updater/platform.rs | 12 ++++++
+ 2 files changed, 20 insertions(+), 32 deletions(-)
+
+commit 7994901f1dcccccccccccccccccccccccccccccccc
+Author: A <a@example.com>
+Date:   Sun Sep 27 09:00:00 2026 +0200
+
+    fix(text_decode): use as_chunks
+
+    - one
+    - two
+    + not an addition
+
+ rust/src/text_decode.rs | 1 +
+ 1 file changed, 1 insertion(+)
+";
+
+    #[test]
+    fn stat_totals_come_from_git_summary_lines_not_body_bullets() {
+        let out = compress_log("git log --stat -3", BULLET_BODY_STAT);
+        assert!(out.contains("[3 commits, +21/-32 total]"), "{out}");
+        assert!(out.contains("d411020 refactor(updater): move release-asset selection"));
+        assert!(out.contains("8c93333 Merge pull request #1883"));
+    }
+
+    #[test]
+    fn body_bullets_without_stats_produce_no_totals() {
+        let input = "commit abcdef0123456789\nAuthor: A <a@e.com>\nDate:   Mon\n\n    feat: x\n\n    - a bullet\n    - another\n";
+        let out = compress_log("git log -1", input);
+        assert!(
+            !out.contains("total]"),
+            "no reliable source → no totals: {out}"
+        );
+        assert!(out.contains("abcdef0 feat: x"));
+    }
+
+    #[test]
+    fn shortstat_only_output_is_summed() {
+        let input = "commit aaaaaaa1111111\nAuthor: A\nDate:   Mon\n\n    one\n\n 1 file changed, 5 insertions(+)\n\ncommit bbbbbbb2222222\nAuthor: A\nDate:   Mon\n\n    two\n\n 3 files changed, 2 insertions(+), 9 deletions(-)\n";
+        let out = compress_log("git log --shortstat", input);
+        assert!(out.contains("[2 commits, +7/-9 total]"), "{out}");
+    }
+
+    #[test]
+    fn numstat_rows_are_summed() {
+        let input = "commit aaaaaaa1111111\nAuthor: A\nDate:   Mon\n\n    - bullet body\n\n10\t2\tsrc/a.rs\n-\t-\tlogo.png\n3\t0\tsrc/b.rs\n";
+        let out = compress_log("git log --numstat", input);
+        assert!(out.contains("[1 commits, +13/-2 total]"), "{out}");
+    }
+
+    #[test]
+    fn hunk_lines_count_only_inside_hunks() {
+        // Reached without -p in the command (e.g. `log.showDiff`/aliases).
+        let input = "commit aaaaaaa1111111\nAuthor: A\nDate:   Mon\n\n    - body bullet\n\ndiff --git a/q.sql b/q.sql\nindex 1..2 100644\n--- a/q.sql\n+++ b/q.sql\n@@ -1,2 +1,2 @@\n--- removed sql comment\n+-- added sql comment\n unchanged\n";
+        let out = compress_log("git log", input);
+        assert!(out.contains("[1 commits, +1/-1 total]"), "{out}");
+    }
 }

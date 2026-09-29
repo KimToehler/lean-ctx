@@ -33,6 +33,17 @@ fn deletions_re() -> &'static regex::Regex {
 fn files_changed_re() -> &'static regex::Regex {
     static_regex!(r"(\d+) files? changed")
 }
+/// git's own ` N files changed, X insertions(+), Y deletions(-)` line. The
+/// single leading space tells it apart from a `git log` body (four spaces).
+fn shortstat_line_re() -> &'static regex::Regex {
+    static_regex!(
+        r"^ \d+ files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?\s*$"
+    )
+}
+/// A `--numstat` row: `<added>\t<deleted>\t<path>` (`-` for binary files).
+fn numstat_row_re() -> &'static regex::Regex {
+    static_regex!(r"^(\d+|-)\t(\d+|-)\t")
+}
 fn clone_objects_re() -> &'static regex::Regex {
     static_regex!(r"Receiving objects:.*?(\d+)")
 }

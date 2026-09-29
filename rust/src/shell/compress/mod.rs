@@ -17,3 +17,9 @@ pub(super) use engine::compress_and_measure;
 
 pub use classification::has_structural_output;
 pub use classification::is_verbatim_output;
+
+/// Size of the built-in passthrough list, for the docs drift check (#1896).
+#[cfg(test)]
+pub(crate) fn builtin_passthrough_count() -> usize {
+    passthrough::BUILTIN_PASSTHROUGH.len()
+}
